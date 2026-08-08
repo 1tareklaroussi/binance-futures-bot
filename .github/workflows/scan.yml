@@ -1,1 +1,28 @@
+name: Binance Futures RSI MACD Scanner
 
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scan Binance Futures
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.8990510095:AAH8Gdtp3xjsCN2vR00GJ1NvEUQj0GLsXnQ }}
+          TELEGRAM_CHAT_ID: ${{ secrets.7776631198 }}
+        run: python bot.py
