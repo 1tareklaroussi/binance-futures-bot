@@ -23,6 +23,6 @@ jobs:
 
       - name: Scan Binance Futures
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.8990510095:AAH8Gdtp3xjsCN2vR00GJ1NvEUQj0GLsXnQ }}
-          TELEGRAM_CHAT_ID: ${{ secrets.7776631198 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
