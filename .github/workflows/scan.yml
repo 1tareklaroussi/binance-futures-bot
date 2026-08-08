@@ -1,28 +1,15 @@
-name: Binance Futures RSI MACD Scanner
+import requests
 
-on:
-  schedule:
-    - cron: "5 * * * *"
-  workflow_dispatch:
+urls = [
+    "https://fapi.binance.com/fapi/v1/time",
+    "https://fapi.binance.com/fapi/v1/exchangeInfo",
+]
 
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Scan Binance Futures
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot.py
+for url in urls:
+    try:
+        r = requests.get(url, timeout=15)
+        print(url)
+        print("STATUS:", r.status_code)
+        print(r.text[:500])
+    except Exception as e:
+        print("ERROR:", e)
