@@ -5,26 +5,30 @@ import requests
 import pandas as pd
 import numpy as np
 
+
 # ============================================================
 # CONFIG
 # ============================================================
 
-BINANCE_BASE = "https://fapi.binance.com"
+BYBIT_BASE = "https://api.bybit.com"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-INTERVAL = "1h"
+INTERVAL = "60"          # 1H
 KLINE_LIMIT = 250
 
-# أقل قوة لإرسال إشارة
 MIN_SIGNAL_STRENGTH = 70
 
-# عدد العملات التي نفحصها في كل دورة
+# عدد العملات التي سيتم تحليلها
 MAX_SYMBOLS = 40
 
-# الانتظار بين طلبات Binance
+# تأخير بسيط بين الطلبات
 REQUEST_DELAY = 0.15
+
+# عدد محاولات الاتصال
+MAX_RETRIES = 5
+
 
 # ============================================================
 # LOGGING
@@ -37,42 +41,52 @@ logging.basicConfig(
 
 session = requests.Session()
 
-# لتجنب إرسال نفس الإشارة عدة مرات
+# منع تكرار نفس الإشارة أثناء تشغيل البرنامج
 last_signals = {}
 
 
 # ============================================================
-# BINANCE REQUEST
+# HTTP REQUEST
 # ============================================================
 
-def binance_get(path, params=None, retries=5):
+def api_get(path, params=None):
 
-    for attempt in range(retries):
+    for attempt in range(MAX_RETRIES):
 
         try:
+
             response = session.get(
-                BINANCE_BASE + path,
+                BYBIT_BASE + path,
                 params=params,
                 timeout=15
             )
 
             # Rate limit
             if response.status_code == 429:
-                wait = min(2 ** attempt, 30)
+
+                wait = min(
+                    2 ** attempt,
+                    30
+                )
 
                 logging.warning(
-                    f"Binance 429 - waiting {wait}s"
+                    f"Bybit 429 - waiting {wait}s"
                 )
 
                 time.sleep(wait)
                 continue
 
-            # Temporary server errors
-            if response.status_code in (418, 500, 502, 503, 504):
-                wait = min(2 ** attempt, 30)
+            # Server errors
+            if response.status_code >= 500:
+
+                wait = min(
+                    2 ** attempt,
+                    30
+                )
 
                 logging.warning(
-                    f"Binance HTTP {response.status_code} - waiting {wait}s"
+                    f"Bybit HTTP {response.status_code} "
+                    f"- waiting {wait}s"
                 )
 
                 time.sleep(wait)
@@ -80,16 +94,33 @@ def binance_get(path, params=None, retries=5):
 
             response.raise_for_status()
 
+            data = response.json()
+
+            # Bybit API-level error
+            if data.get("retCode", 0) != 0:
+
+                logging.warning(
+                    f"Bybit API error: "
+                    f"{data.get('retCode')} "
+                    f"{data.get('retMsg')}"
+                )
+
+                return None
+
             time.sleep(REQUEST_DELAY)
 
-            return response.json()
+            return data
 
         except requests.RequestException as e:
 
-            wait = min(2 ** attempt, 30)
+            wait = min(
+                2 ** attempt,
+                30
+            )
 
             logging.warning(
-                f"Request error: {e} | retry in {wait}s"
+                f"Request error: {e} "
+                f"| retry in {wait}s"
             )
 
             time.sleep(wait)
@@ -115,15 +146,17 @@ def send_telegram(message):
 
     try:
 
-        r = session.post(
+        response = session.post(
             url,
             data=payload,
             timeout=15
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
-        logging.info("Telegram signal sent")
+        logging.info(
+            "Telegram signal sent successfully"
+        )
 
         return True
 
@@ -137,40 +170,58 @@ def send_telegram(message):
 
 
 # ============================================================
-# GET FUTURES SYMBOLS
+# GET LINEAR USDT SYMBOLS
 # ============================================================
 
 def get_symbols():
 
-    data = binance_get(
-        "/fapi/v1/exchangeInfo"
+    data = api_get(
+        "/v5/market/instruments-info",
+        {
+            "category": "linear",
+            "limit": 1000
+        }
     )
 
     if not data:
         return []
 
-    symbols = []
+    result = []
 
-    for item in data["symbols"]:
+    items = data.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
+
+    for item in items:
 
         if (
-            item["status"] == "TRADING"
-            and item["contractType"] == "PERPETUAL"
-            and item["quoteAsset"] == "USDT"
+            item.get("status") == "Trading"
+            and item.get("contractType") == "LinearPerpetual"
+            and item.get("settleCoin") == "USDT"
         ):
-            symbols.append(item["symbol"])
 
-    return symbols
+            result.append(
+                item["symbol"]
+            )
+
+    return result
 
 
 # ============================================================
-# GET 24H VOLUME
+# GET 24H TICKERS
 # ============================================================
 
-def get_volume_rank():
+def get_tickers():
 
-    data = binance_get(
-        "/fapi/v1/ticker/24hr"
+    data = api_get(
+        "/v5/market/tickers",
+        {
+            "category": "linear"
+        }
     )
 
     if not data:
@@ -178,21 +229,35 @@ def get_volume_rank():
 
     result = {}
 
-    for item in data:
+    items = data.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
 
-        symbol = item["symbol"]
+    for item in items:
 
-        if symbol.endswith("USDT"):
+        symbol = item.get("symbol")
 
-            try:
-                volume = float(
-                    item["quoteVolume"]
+        if not symbol:
+            continue
+
+        try:
+
+            turnover = float(
+                item.get(
+                    "turnover24h",
+                    0
                 )
+            )
 
-                result[symbol] = volume
+            result[symbol] = turnover
 
-            except:
-                pass
+        except (ValueError, TypeError):
+
+            result[symbol] = 0
 
     return result
 
@@ -203,9 +268,10 @@ def get_volume_rank():
 
 def get_klines(symbol):
 
-    data = binance_get(
-        "/fapi/v1/klines",
+    data = api_get(
+        "/v5/market/kline",
         {
+            "category": "linear",
             "symbol": symbol,
             "interval": INTERVAL,
             "limit": KLINE_LIMIT
@@ -215,23 +281,32 @@ def get_klines(symbol):
     if not data:
         return None
 
+    rows = data.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
+
+    if not rows:
+        return None
+
+    # Bybit returns newest first.
+    rows = list(reversed(rows))
+
     columns = [
-        "open_time",
+        "timestamp",
         "open",
         "high",
         "low",
         "close",
         "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-        "ignore"
+        "turnover"
     ]
 
     df = pd.DataFrame(
-        data,
+        rows,
         columns=columns
     )
 
@@ -241,14 +316,22 @@ def get_klines(symbol):
         "low",
         "close",
         "volume",
-        "quote_volume"
+        "turnover"
     ]
 
-    for col in numeric_columns:
-        df[col] = pd.to_numeric(
-            df[col],
+    for column in numeric_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
+
+    df["timestamp"] = pd.to_numeric(
+        df["timestamp"],
+        errors="coerce"
+    )
+
+    df = df.dropna()
 
     return df
 
@@ -257,7 +340,10 @@ def get_klines(symbol):
 # EMA
 # ============================================================
 
-def calculate_ema(series, period):
+def calculate_ema(
+    series,
+    period
+):
 
     return series.ewm(
         span=period,
@@ -269,12 +355,20 @@ def calculate_ema(series, period):
 # RSI
 # ============================================================
 
-def calculate_rsi(series, period=14):
+def calculate_rsi(
+    series,
+    period=14
+):
 
     delta = series.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / period,
@@ -286,13 +380,17 @@ def calculate_rsi(series, period=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
     )
 
-    rsi = 100 - (
-        100 / (1 + rs)
+    rsi = (
+        100 -
+        (100 / (1 + rs))
     )
 
     return rsi.fillna(50)
@@ -309,33 +407,43 @@ def calculate_macd(
     signal=9
 ):
 
-    ema_fast = calculate_ema(
+    fast_ema = calculate_ema(
         series,
         fast
     )
 
-    ema_slow = calculate_ema(
+    slow_ema = calculate_ema(
         series,
         slow
     )
 
-    macd = ema_fast - ema_slow
+    macd = fast_ema - slow_ema
 
     signal_line = calculate_ema(
         macd,
         signal
     )
 
-    histogram = macd - signal_line
+    histogram = (
+        macd -
+        signal_line
+    )
 
-    return macd, signal_line, histogram
+    return (
+        macd,
+        signal_line,
+        histogram
+    )
 
 
 # ============================================================
 # ATR
 # ============================================================
 
-def calculate_atr(df, period=14):
+def calculate_atr(
+    df,
+    period=14
+):
 
     high = df["high"]
     low = df["low"]
@@ -346,15 +454,21 @@ def calculate_atr(df, period=14):
     tr1 = high - low
 
     tr2 = (
-        high - previous_close
+        high -
+        previous_close
     ).abs()
 
     tr3 = (
-        low - previous_close
+        low -
+        previous_close
     ).abs()
 
     true_range = pd.concat(
-        [tr1, tr2, tr3],
+        [
+            tr1,
+            tr2,
+            tr3
+        ],
         axis=1
     ).max(axis=1)
 
@@ -374,12 +488,14 @@ def analyze_symbol(symbol):
 
     df = get_klines(symbol)
 
-    if df is None or len(df) < 220:
+    if df is None:
+        return None
+
+    if len(df) < 220:
         return None
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # Ignore the currently forming candle.
+    # Ignore currently forming candle
     # --------------------------------------------------------
 
     df = df.iloc[:-1].copy()
@@ -389,7 +505,10 @@ def analyze_symbol(symbol):
 
     close = df["close"]
 
+    # --------------------------------------------------------
     # Indicators
+    # --------------------------------------------------------
+
     df["ema50"] = calculate_ema(
         close,
         50
@@ -404,31 +523,41 @@ def analyze_symbol(symbol):
         df["macd"],
         df["macd_signal"],
         df["macd_hist"]
-    ) = calculate_macd(close)
+    ) = calculate_macd(
+        close
+    )
 
     df["rsi"] = calculate_rsi(
-        close,
-        14
+        close
     )
 
     df["atr"] = calculate_atr(
-        df,
-        14
+        df
     )
 
     # --------------------------------------------------------
-    # Current candle
+    # Current closed candle
     # --------------------------------------------------------
 
     current = df.iloc[-1]
     previous = df.iloc[-2]
 
-    price = float(current["close"])
+    price = float(
+        current["close"]
+    )
 
-    ema50 = float(current["ema50"])
-    ema200 = float(current["ema200"])
+    ema50 = float(
+        current["ema50"]
+    )
 
-    macd = float(current["macd"])
+    ema200 = float(
+        current["ema200"]
+    )
+
+    macd = float(
+        current["macd"]
+    )
+
     macd_signal = float(
         current["macd_signal"]
     )
@@ -441,103 +570,139 @@ def analyze_symbol(symbol):
         previous["macd_hist"]
     )
 
-    rsi = float(current["rsi"])
+    rsi = float(
+        current["rsi"]
+    )
 
-    atr = float(current["atr"])
+    atr = float(
+        current["atr"]
+    )
 
-    if atr <= 0:
+    if not np.isfinite(atr) or atr <= 0:
         return None
 
     # ========================================================
-    # SCORE SYSTEM
+    # SIGNAL SCORE
     # ========================================================
 
     buy_score = 0
     sell_score = 0
 
-    # --------------------------------------------------------
-    # EMA TREND = 25 points
-    # --------------------------------------------------------
+    # ========================================================
+    # EMA TREND = 25
+    # ========================================================
 
     if ema50 > ema200:
+
         buy_score += 25
 
     elif ema50 < ema200:
+
         sell_score += 25
 
-    # --------------------------------------------------------
-    # MACD = 25 points
-    # --------------------------------------------------------
+    # ========================================================
+    # MACD = 25
+    # ========================================================
 
     if (
         macd > macd_signal
         and macd_hist > 0
     ):
+
         buy_score += 25
 
     elif (
         macd < macd_signal
         and macd_hist < 0
     ):
+
         sell_score += 25
 
-    # --------------------------------------------------------
-    # RSI = 20 points
-    # --------------------------------------------------------
+    # ========================================================
+    # RSI = 20
+    # ========================================================
 
-    # We don't want to buy when RSI is extremely overbought.
     if 50 <= rsi <= 68:
+
         buy_score += 20
 
-    elif 32 <= rsi <= 50:
+    elif 32 <= rsi < 50:
+
         sell_score += 20
 
-    # Strong momentum continuation
     elif rsi > 68:
+
         buy_score += 10
 
     elif rsi < 32:
+
         sell_score += 10
 
-    # --------------------------------------------------------
-    # VOLUME = 15 points
-    # --------------------------------------------------------
+    # ========================================================
+    # VOLUME = 15
+    # ========================================================
 
-    avg_volume = df["volume"].iloc[-21:-1].mean()
+    avg_volume = (
+        df["volume"]
+        .iloc[-21:-1]
+        .mean()
+    )
 
     current_volume = float(
         current["volume"]
     )
 
-    volume_ratio = (
-        current_volume / avg_volume
-        if avg_volume > 0
-        else 0
+    if avg_volume > 0:
+
+        volume_ratio = (
+            current_volume /
+            avg_volume
+        )
+
+    else:
+
+        volume_ratio = 0
+
+    candle_direction = (
+        float(current["close"]) >
+        float(current["open"])
     )
 
     if volume_ratio >= 1.5:
 
-        # Strong volume
-        if close.iloc[-1] > close.iloc[-2]:
+        if candle_direction:
+
             buy_score += 15
 
-        elif close.iloc[-1] < close.iloc[-2]:
+        else:
+
             sell_score += 15
 
     elif volume_ratio >= 1.15:
 
-        if close.iloc[-1] > close.iloc[-2]:
+        if candle_direction:
+
             buy_score += 8
 
-        elif close.iloc[-1] < close.iloc[-2]:
+        else:
+
             sell_score += 8
 
-    # --------------------------------------------------------
-    # PRICE ACTION = 15 points
-    # --------------------------------------------------------
+    # ========================================================
+    # PRICE ACTION = 15
+    # ========================================================
 
-    recent_high = df["high"].iloc[-21:-1].max()
-    recent_low = df["low"].iloc[-21:-1].min()
+    recent_high = (
+        df["high"]
+        .iloc[-21:-1]
+        .max()
+    )
+
+    recent_low = (
+        df["low"]
+        .iloc[-21:-1]
+        .min()
+    )
 
     current_high = float(
         current["high"]
@@ -547,48 +712,55 @@ def analyze_symbol(symbol):
         current["low"]
     )
 
+    current_open = float(
+        current["open"]
+    )
+
     current_close = float(
         current["close"]
     )
 
     # Bullish breakout
     if current_close > recent_high:
+
         buy_score += 15
 
     # Bearish breakout
     elif current_close < recent_low:
+
         sell_score += 15
 
     else:
 
-        # Momentum candle
         candle_range = (
-            current_high - current_low
+            current_high -
+            current_low
         )
 
         if candle_range > 0:
 
             body = abs(
-                current_close
-                - float(current["open"])
+                current_close -
+                current_open
             )
 
             body_ratio = (
-                body / candle_range
+                body /
+                candle_range
             )
 
             if body_ratio >= 0.65:
 
-                if current_close > float(
-                    current["open"]
-                ):
+                if current_close > current_open:
+
                     buy_score += 8
 
                 else:
+
                     sell_score += 8
 
     # ========================================================
-    # DETERMINE SIGNAL
+    # DETERMINE DIRECTION
     # ========================================================
 
     if buy_score > sell_score:
@@ -602,23 +774,28 @@ def analyze_symbol(symbol):
         strength = sell_score
 
     else:
+
         return None
 
-    # Don't send weak signals
+    # --------------------------------------------------------
+    # Minimum strength
+    # --------------------------------------------------------
+
     if strength < MIN_SIGNAL_STRENGTH:
+
         return None
 
     # ========================================================
-    # MACD MOMENTUM CONFIRMATION
+    # MACD MOMENTUM FILTER
     # ========================================================
 
-    # Avoid some signals where MACD is losing momentum
     if direction == "BUY":
 
         if (
             macd_hist < previous_hist
             and strength < 80
         ):
+
             return None
 
     if direction == "SELL":
@@ -627,6 +804,7 @@ def analyze_symbol(symbol):
             macd_hist > previous_hist
             and strength < 80
         ):
+
             return None
 
     # ========================================================
@@ -636,20 +814,21 @@ def analyze_symbol(symbol):
     entry = price
 
     # ========================================================
-    # STOP LOSS / TAKE PROFIT
+    # SL / TP
     #
     # Risk = 1 ATR
-    # TP1 = 1.0R
-    # TP2 = 2.0R
+    # TP1 = 1R
+    # TP2 = 2R
     # ========================================================
 
-    risk = atr * 1.0
+    risk = atr
 
     if direction == "BUY":
 
         sl = entry - risk
 
         tp1 = entry + risk
+
         tp2 = entry + (
             risk * 2
         )
@@ -659,13 +838,10 @@ def analyze_symbol(symbol):
         sl = entry + risk
 
         tp1 = entry - risk
+
         tp2 = entry - (
             risk * 2
         )
-
-    # ========================================================
-    # RETURN
-    # ========================================================
 
     return {
         "symbol": symbol,
@@ -674,33 +850,39 @@ def analyze_symbol(symbol):
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
-        "tp2": tp2,
-        "rsi": rsi,
-        "atr": atr
+        "tp2": tp2
     }
 
 
 # ============================================================
-# FORMAT PRICE
+# PRICE FORMAT
 # ============================================================
 
 def format_price(price):
 
     if price >= 1000:
+
         return f"{price:,.0f}"
 
     elif price >= 100:
+
         return f"{price:,.2f}"
 
     elif price >= 1:
+
         return f"{price:,.3f}"
 
+    elif price >= 0.01:
+
+        return f"{price:,.5f}"
+
     else:
-        return f"{price:,.6f}"
+
+        return f"{price:,.8f}"
 
 
 # ============================================================
-# BUILD TELEGRAM MESSAGE
+# TELEGRAM MESSAGE
 # ============================================================
 
 def build_message(signal):
@@ -717,45 +899,57 @@ def build_message(signal):
 
 
 # ============================================================
-# MAIN SCANNER
+# MARKET SCANNER
 # ============================================================
 
 def scan_market():
 
-    logging.info("Getting Futures symbols...")
+    logging.info(
+        "Getting Bybit Linear USDT symbols..."
+    )
 
     symbols = get_symbols()
 
     if not symbols:
 
         logging.error(
-            "Could not get Binance symbols"
+            "Could not get Bybit symbols"
         )
 
         return
 
     logging.info(
-        f"Found {len(symbols)} Futures symbols"
+        f"Found {len(symbols)} USDT perpetual contracts"
     )
 
     # --------------------------------------------------------
-    # Rank by 24h volume
+    # Get 24h turnover
     # --------------------------------------------------------
 
-    volumes = get_volume_rank()
+    tickers = get_tickers()
+
+    # --------------------------------------------------------
+    # Rank symbols by liquidity
+    # --------------------------------------------------------
 
     symbols = sorted(
         symbols,
-        key=lambda x: volumes.get(x, 0),
+        key=lambda symbol:
+            tickers.get(symbol, 0),
         reverse=True
     )
 
-    # Only analyze the most liquid symbols
-    symbols = symbols[:MAX_SYMBOLS]
+    symbols = symbols[
+        :MAX_SYMBOLS
+    ]
 
     logging.info(
-        f"Scanning top {len(symbols)} symbols..."
+        f"Scanning top {len(symbols)} liquid symbols..."
     )
+
+    # --------------------------------------------------------
+    # Analyze
+    # --------------------------------------------------------
 
     for symbol in symbols:
 
@@ -769,29 +963,35 @@ def scan_market():
                 continue
 
             # ------------------------------------------------
-            # Prevent duplicate signal
+            # Duplicate protection
             # ------------------------------------------------
 
             signal_key = (
                 signal["direction"],
-                signal["strength"]
+                signal["strength"],
+                round(
+                    signal["entry"],
+                    8
+                )
             )
 
-            if last_signals.get(symbol) == signal_key:
+            if (
+                last_signals.get(symbol)
+                == signal_key
+            ):
 
                 logging.info(
-                    f"{symbol}: duplicate signal ignored"
+                    f"{symbol}: duplicate ignored"
                 )
 
                 continue
 
-            # Save signal
             last_signals[
                 symbol
             ] = signal_key
 
             # ------------------------------------------------
-            # Telegram
+            # Build message
             # ------------------------------------------------
 
             message = build_message(
@@ -811,12 +1011,12 @@ def scan_market():
         except Exception as e:
 
             logging.exception(
-                f"Error analyzing {symbol}: {e}"
+                f"{symbol} analysis error: {e}"
             )
 
 
 # ============================================================
-# RUN
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
@@ -825,28 +1025,8 @@ if __name__ == "__main__":
         "🚀 Futures Signal Bot started"
     )
 
-    while True:
+    scan_market()
 
-        try:
-
-            scan_market()
-
-        except Exception as e:
-
-            logging.exception(
-                f"Main loop error: {e}"
-            )
-
-        # ----------------------------------------------------
-        # Scan every 10 minutes.
-        #
-        # The bot uses only CLOSED 1H candles,
-        # so scanning more frequently doesn't create
-        # new candle signals.
-        # ----------------------------------------------------
-
-        logging.info(
-            "Waiting 10 minutes..."
-        )
-
-        time.sleep(600)
+    logging.info(
+        "✅ Scan finished"
+    )
