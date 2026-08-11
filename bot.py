@@ -1,298 +1,1865 @@
 # ============================================================
-# 🚀 CRYPTO SIGNAL BOT — GITHUB ACTIONS V3
-# MACD + RSI REVERSAL + EMA200 + VOLUME + CANDLE CONFIRMATION
-# Yahoo Finance OHLCV
+# 🚀 CRYPTO STRATEGY BACKTEST V5
+#
+# STRATEGY:
+# 4H TREND
+#     ↓
+# 1H BREAKOUT
+#     ↓
+# 15M RETEST
+#     ↓
+# RSI + VOLUME + CANDLE
+#     ↓
+# ENTRY
+#
+# DATA:
+# Binance Futures Historical Klines
+#
+# OUTPUT:
+# - Win Rate
+# - Loss Rate
+# - Profit Factor
+# - Net R
+# - Average R
+# - Max Drawdown
+# - Max Consecutive Losses
+# - BUY / SELL statistics
+# - CSV results
+#
+# IMPORTANT:
+# This is a backtest simulator.
+# It does NOT guarantee future performance.
 # ============================================================
 
-import os
-import time
-import logging
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import time
+import os
+from datetime import datetime, timezone
 
-# ============================================================
-# 🔐 TELEGRAM — GITHUB SECRETS
-# ============================================================
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN is missing from GitHub Secrets")
-
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("❌ TELEGRAM_CHAT_ID is missing from GitHub Secrets")
 
 # ============================================================
 # ⚙️ SETTINGS
 # ============================================================
 
-INTERVAL = "1h"
-PERIOD = "30d"
-MIN_RR = 1.5
-ATR_SL_MULTIPLIER = 1.0
-TP1_R = 1.5
-TP2_R = 2.5
+BASE_URL = "https://fapi.binance.com"
 
-# ============================================================
-# 📊 FILTER SETTINGS
-# ============================================================
-EMA_TREND_PERIOD = 200
+# How many days to test
+BACKTEST_DAYS = 180
+
+# Timeframes
+TF_1H = "1h"
+TF_15M = "15m"
+
+# Indicators
+EMA_FAST = 50
+EMA_TREND = 200
+
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+
 VOLUME_PERIOD = 20
 VOLUME_MULTIPLIER = 1.20
-CANDLE_BODY_RATIO = 0.55
-CANDLE_CLOSE_RATIO = 0.25
+
+BREAKOUT_LOOKBACK = 20
+
+# Retest
+RETEST_ATR_TOLERANCE = 0.35
+
+# SL
+ATR_SL_MULTIPLIER = 1.20
+
+# Take profits
+TP1_R = 1.5
+TP2_R = 2.5
+TP3_R = 3.5
+
+# Minimum setup score
+MIN_SCORE = 7
+
+# Initial capital
+INITIAL_BALANCE = 10000.0
+
+# Risk per trade
+RISK_PERCENT = 1.0
+
+# Fees
+# Change according to your actual futures account.
+FEE_RATE = 0.0004
+
+# Slippage simulation
+SLIPPAGE = 0.0002
+
+# Maximum bars to keep a trade open
+MAX_TRADE_BARS = 96
+
 
 # ============================================================
 # 🪙 SYMBOLS
 # ============================================================
 
 SYMBOLS = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", 
-    "ADA-USD", "AVAX-USD", "LINK-USD", "DOT-USD", "MATIC-USD", "LTC-USD", 
-    "SHIB-USD", "TRX-USD", "BCH-USD", "NEAR-USD", "UNI-USD", "ATOM-USD", 
-    "XLM-USD", "XMR-USD", "ETC-USD", "ICP-USD", "FIL-USD", "HBAR-USD", 
-    "VET-USD", "APT-USD", "OP-USD", "ARB-USD", "INJ-USD", "RNDR-USD", 
-    "FTM-USD", "SUI-USD", "SEI-USD", "GALA-USD", "SAND-USD", "MANA-USD", 
-    "AAVE-USD", "SNX-USD", "MKR-USD", "AXS-USD", "TIA-USD", "TAO-USD", 
-    "KAS-USD", "STX-USD", "IMX-USD", "PEPE-USD", "WIF-USD", "BONK-USD", 
-    "FLOKI-USD", "JUP-USD", "PYTH-USD", "RUNE-USD", "ALGO-USD", "EGLD-USD", 
-    "QNT-USD", "EOS-USD", "XTZ-USD", "FLOW-USD", "THETA-USD", "CRV-USD", 
-    "LDO-USD", "COMP-USD", "ZEC-USD", "DASH-USD"
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "DOTUSDT",
+    "LTCUSDT",
+    "SHIBUSDT",
+    "TRXUSDT",
+    "BCHUSDT",
+    "NEARUSDT",
+    "UNIUSDT",
+    "ATOMUSDT",
+    "XLMUSDT",
+    "XMRUSDT",
+    "ETCUSDT",
+    "ICPUSDT",
+    "FILUSDT",
+    "HBARUSDT",
+    "VETUSDT",
+    "APTUSDT",
+    "OPUSDT",
+    "ARBUSDT",
+    "INJUSDT",
+    "RENDERUSDT",
+    "SUIUSDT",
+    "SEIUSDT",
+    "GALAUSDT",
+    "SANDUSDT",
+    "MANAUSDT",
+    "AAVEUSDT",
+    "SNXUSDT",
+    "MKRUSDT",
+    "AXSUSDT",
+    "TIAUSDT",
+    "TAOUSDT",
+    "KASUSDT",
+    "STXUSDT",
+    "IMXUSDT",
+    "PEPEUSDT",
+    "WIFUSDT",
+    "BONKUSDT",
+    "FLOKIUSDT",
+    "JUPUSDT",
+    "PYTHUSDT",
+    "RUNEUSDT",
+    "ALGOUSDT",
+    "EGLDUSDT",
+    "QNTUSDT",
+    "EOSUSDT",
+    "XTZUSDT",
+    "FLOWUSDT",
+    "THETAUSDT",
+    "CRVUSDT",
+    "LDOUSDT",
+    "COMPUSDT",
+    "ZECUSDT",
+    "DASHUSDT"
 ]
 
-# ============================================================
-# 📝 LOGGING & HELPERS
-# ============================================================
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-def telegram_symbol(symbol):
-    return symbol.replace("-USD", "USDT")
-
-def format_price(price):
-    if price >= 1000: return f"{price:,.0f}"
-    if price >= 100: return f"{price:,.2f}"
-    if price >= 1: return f"{price:,.3f}"
-    if price >= 0.01: return f"{price:,.5f}"
-    return f"{price:,.8f}"
 
 # ============================================================
-# 📥 DATA FETCHING
+# 📡 BINANCE DATA
 # ============================================================
 
-def get_data(symbol):
-    try:
-        df = yf.download(symbol, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty:
-            logging.warning(f"{symbol}: No data received")
-            return None
+def get_klines(symbol, interval, start_ms, end_ms):
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
+    all_data = []
 
-        columns = ["Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in columns):
-            logging.warning(f"{symbol}: Missing required columns")
-            return None
+    current_start = start_ms
 
-        df = df[columns].copy()
-        for c in columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.dropna(inplace=True)
+    while current_start < end_ms:
 
-        if len(df) < 220:
-            logging.warning(f"{symbol}: Not enough candles ({len(df)})")
-            return None
+        url = f"{BASE_URL}/fapi/v1/klines"
 
-        return df.iloc[:-1].copy()
-    except Exception as e:
-        logging.error(f"{symbol} data error: {e}")
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": current_start,
+            "endTime": end_ms,
+            "limit": 1000
+        }
+
+        try:
+
+            response = requests.get(
+                url,
+                params=params,
+                timeout=20
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+        except Exception as e:
+
+            print(
+                f"❌ {symbol} {interval} "
+                f"download error: {e}"
+            )
+
+            time.sleep(3)
+
+            continue
+
+        if not data:
+            break
+
+        all_data.extend(data)
+
+        last_open_time = data[-1][0]
+
+        if last_open_time <= current_start:
+            break
+
+        current_start = last_open_time + 1
+
+        time.sleep(0.15)
+
+    if not all_data:
         return None
+
+    columns = [
+        "OpenTime",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "CloseTime",
+        "QuoteVolume",
+        "Trades",
+        "TakerBuyVolume",
+        "TakerBuyQuoteVolume",
+        "Ignore"
+    ]
+
+    df = pd.DataFrame(
+        all_data,
+        columns=columns
+    )
+
+    df["OpenTime"] = pd.to_datetime(
+        df["OpenTime"],
+        unit="ms",
+        utc=True
+    )
+
+    df.set_index(
+        "OpenTime",
+        inplace=True
+    )
+
+    numeric_columns = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    for column in numeric_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df[numeric_columns]
+
+    df.dropna(inplace=True)
+
+    df = df[~df.index.duplicated(
+        keep="first"
+    )]
+
+    return df
+
 
 # ============================================================
 # 📊 INDICATORS
 # ============================================================
 
 def EMA(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+
+    return series.ewm(
+        span=period,
+        adjust=False
+    ).mean()
+
 
 def RSI(series, period=14):
+
     delta = series.diff()
+
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50)
 
-def MACD(series):
-    ema12 = EMA(series, 12)
-    ema26 = EMA(series, 26)
-    macd = ema12 - ema26
-    signal = EMA(macd, 9)
-    histogram = macd - signal
-    return macd, signal, histogram
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
-def ATR(df, period=14):
-    previous_close = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - previous_close).abs(),
-        (df["Low"] - previous_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
-# ============================================================
-# 🧠 ANALYSIS
-# ============================================================
-
-def analyze(symbol):
-    df = get_data(symbol)
-    if df is None or len(df) < 220: return None
-
-    close = df["Close"]
-    macd, macd_signal, histogram = MACD(close)
-    df["MACD"], df["MACD_SIGNAL"], df["MACD_HIST"] = macd, macd_signal, histogram
-    df["RSI"] = RSI(close, 14)
-    df["ATR"] = ATR(df, 14)
-    df["EMA200"] = EMA(close, EMA_TREND_PERIOD)
-    df["VOLUME_MA20"] = df["Volume"].rolling(VOLUME_PERIOD).mean()
-
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    bullish_cross = (prev["MACD"] <= prev["MACD_SIGNAL"] and curr["MACD"] > curr["MACD_SIGNAL"])
-    bearish_cross = (prev["MACD"] >= prev["MACD_SIGNAL"] and curr["MACD"] < curr["MACD_SIGNAL"])
-
-    recent_rsi = df["RSI"].iloc[-3:]
-    rsi_oversold = (recent_rsi <= 30).any()
-    rsi_overbought = (recent_rsi >= 70).any()
-
-    bullish_trend = curr["Close"] > curr["EMA200"]
-    bearish_trend = curr["Close"] < curr["EMA200"]
-
-    volume_confirmed = curr["Volume"] > (curr["VOLUME_MA20"] * VOLUME_MULTIPLIER)
-
-    candle_range = curr["High"] - curr["Low"]
-    if candle_range <= 0: return None
-    
-    candle_body = abs(curr["Close"] - curr["Open"])
-    body_ratio = candle_body / candle_range
-
-    bullish_candle = (curr["Close"] > curr["Open"] and body_ratio >= CANDLE_BODY_RATIO and ((curr["High"] - curr["Close"]) / candle_range) <= CANDLE_CLOSE_RATIO)
-    bearish_candle = (curr["Close"] < curr["Open"] and body_ratio >= CANDLE_BODY_RATIO and ((curr["Close"] - curr["Low"]) / candle_range) <= CANDLE_CLOSE_RATIO)
-
-    direction = None
-    reasons = []
-
-    if bullish_cross and rsi_oversold and bullish_trend and volume_confirmed and bullish_candle:
-        direction = "BUY"
-        reasons.extend(["Bullish MACD Cross Up", f"Oversold RSI ({curr['RSI']:.1f})", "Price Above EMA200", "Volume Confirmed", "Bullish Candle Confirmed"])
-    elif bearish_cross and rsi_overbought and bearish_trend and volume_confirmed and bearish_candle:
-        direction = "SELL"
-        reasons.extend(["Bearish MACD Cross Down", f"Overbought RSI ({curr['RSI']:.1f})", "Price Below EMA200", "Volume Confirmed", "Bearish Candle Confirmed"])
-    else:
-        return None
-
-    price = float(curr["Close"])
-    atr = float(curr["ATR"])
-    if atr <= 0: return None
-    risk = atr * ATR_SL_MULTIPLIER
-
-    if direction == "BUY":
-        sl, tp1, tp2 = price - risk, price + (risk * TP1_R), price + (risk * TP2_R)
-        reward = tp1 - price
-    else:
-        sl, tp1, tp2 = price + risk, price - (risk * TP1_R), price - (risk * TP2_R)
-        reward = price - tp1
-
-    rr = reward / risk
-    if rr < MIN_RR: return None
-
-    return {
-        "symbol": symbol, "direction": direction, "strength": 100,
-        "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr, "reasons": reasons
-    }
-
-# ============================================================
-# 📲 TELEGRAM ALERT
-# ============================================================
-
-def send_signal(signal):
-    symbol = telegram_symbol(signal["symbol"])
-    icon = "🟢" if signal["direction"] == "BUY" else "🔴"
-
-    message = (
-        f"{icon} <b>NEW SIGNAL: {symbol}</b> {icon}\n\n"
-        f"📊 <b>Direction:</b> {signal['direction']}\n"
-        f"💪 <b>Strength:</b> {signal['strength']}%\n"
-        f"🧠 <b>Strategy:</b> MACD + RSI Reversal + EMA200 + Volume + Candle\n"
-        f"✅ <b>Reasons:</b> {', '.join(signal['reasons'])}\n\n"
-        f"🎯 <b>Entry:</b> {format_price(signal['entry'])}\n"
-        f"🛑 <b>Stop Loss:</b> {format_price(signal['sl'])}\n\n"
-        f"💰 <b>Take Profit 1:</b> {format_price(signal['tp1'])}\n"
-        f"🚀 <b>Take Profit 2:</b> {format_price(signal['tp2'])}\n\n"
-        f"⚖️ <b>Risk/Reward:</b> 1:{signal['rr']:.2f}"
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
     )
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        response = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=20)
-        response.raise_for_status()
-        print(f"📨 Telegram alert sent for {symbol}!")
-        return True
-    except Exception as e:
-        print(f"❌ Telegram error for {symbol}: {e}")
+    return (
+        100 -
+        (100 / (1 + rs))
+    ).fillna(50)
+
+
+def ATR(df, period=14):
+
+    previous_close = (
+        df["Close"].shift(1)
+    )
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+
+            (
+                df["High"] -
+                previous_close
+            ).abs(),
+
+            (
+                df["Low"] -
+                previous_close
+            ).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+
+# ============================================================
+# 🕓 BUILD 4H FROM 1H
+# ============================================================
+
+def make_4h(df):
+
+    result = df.resample(
+        "4h"
+    ).agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        }
+    )
+
+    result.dropna(
+        inplace=True
+    )
+
+    return result
+
+
+# ============================================================
+# 🕯️ CANDLE CONFIRMATION
+# ============================================================
+
+def bullish_candle(candle):
+
+    candle_range = (
+        candle["High"] -
+        candle["Low"]
+    )
+
+    if candle_range <= 0:
         return False
 
+    body = abs(
+        candle["Close"] -
+        candle["Open"]
+    )
+
+    body_ratio = (
+        body / candle_range
+    )
+
+    upper_wick = (
+        candle["High"] -
+        candle["Close"]
+    ) / candle_range
+
+    return (
+        candle["Close"] >
+        candle["Open"]
+        and body_ratio >= 0.55
+        and upper_wick <= 0.25
+    )
+
+
+def bearish_candle(candle):
+
+    candle_range = (
+        candle["High"] -
+        candle["Low"]
+    )
+
+    if candle_range <= 0:
+        return False
+
+    body = abs(
+        candle["Close"] -
+        candle["Open"]
+    )
+
+    body_ratio = (
+        body / candle_range
+    )
+
+    lower_wick = (
+        candle["Close"] -
+        candle["Low"]
+    ) / candle_range
+
+    return (
+        candle["Close"] <
+        candle["Open"]
+        and body_ratio >= 0.55
+        and lower_wick <= 0.25
+    )
+
+
 # ============================================================
-# 🔎 SCAN SYSTEM
+# 📈 MARKET STRUCTURE
 # ============================================================
 
-def scan():
-    print("\n" + "=" * 60)
-    print("🔎 NEW MARKET SCAN STARTED")
-    print("=" * 60)
+def higher_high(df):
 
-    signals = []
+    if len(df) < 6:
+        return False
 
-    for symbol in SYMBOLS:
-        print(f"🔍 Analyzing {telegram_symbol(symbol)}...")
-        try:
-            signal = analyze(symbol)
-            if signal:
-                signals.append(signal)
-                print(f"   ✅ {signal['direction']} | STRENGTH: {signal['strength']}% | RR: {signal['rr']:.2f}")
-            else:
-                print("   ⚪ No qualifying setup")
-        except Exception as e:
-            print(f"   ❌ Error: {e}")
-        
-        # 🕒 تأخير زمني لمدة ثانيتين لتجنب الحظر من ياهو فاينانس
-        time.sleep(2)
+    return (
+        df["High"].iloc[-1]
+        >
+        df["High"].iloc[-6:-2].max()
+    )
 
-    if not signals:
-        print("\n❌ No qualifying signals found in this scan cycle.")
-        return
 
-    print(f"\n🏆 FOUND {len(signals)} REVERSAL SIGNAL(S):")
-    for sig in signals:
-        print(f"📤 Sending alert for {telegram_symbol(sig['symbol'])}...")
-        send_signal(sig)
-        time.sleep(1)
+def higher_low(df):
+
+    if len(df) < 6:
+        return False
+
+    return (
+        df["Low"].iloc[-1]
+        >
+        df["Low"].iloc[-6:-2].min()
+    )
+
+
+def lower_high(df):
+
+    if len(df) < 6:
+        return False
+
+    return (
+        df["High"].iloc[-1]
+        <
+        df["High"].iloc[-6:-2].max()
+    )
+
+
+def lower_low(df):
+
+    if len(df) < 6:
+        return False
+
+    return (
+        df["Low"].iloc[-1]
+        <
+        df["Low"].iloc[-6:-2].min()
+    )
+
 
 # ============================================================
-# 🚀 START BOT
+# 🧠 CREATE INDICATORS
+# ============================================================
+
+def prepare_data(df1h, df15):
+
+    df1h = df1h.copy()
+    df15 = df15.copy()
+
+    # -------------------------------
+    # 1H
+    # -------------------------------
+
+    df1h["EMA50"] = EMA(
+        df1h["Close"],
+        EMA_FAST
+    )
+
+    df1h["EMA200"] = EMA(
+        df1h["Close"],
+        EMA_TREND
+    )
+
+    df1h["RSI"] = RSI(
+        df1h["Close"],
+        RSI_PERIOD
+    )
+
+    df1h["ATR"] = ATR(
+        df1h,
+        ATR_PERIOD
+    )
+
+    df1h["VOL_MA"] = (
+        df1h["Volume"]
+        .rolling(VOLUME_PERIOD)
+        .mean()
+    )
+
+    # Previous 20-candle high/low
+    df1h["PREV_HIGH"] = (
+        df1h["High"]
+        .shift(1)
+        .rolling(
+            BREAKOUT_LOOKBACK
+        )
+        .max()
+    )
+
+    df1h["PREV_LOW"] = (
+        df1h["Low"]
+        .shift(1)
+        .rolling(
+            BREAKOUT_LOOKBACK
+        )
+        .min()
+    )
+
+    # -------------------------------
+    # 15M
+    # -------------------------------
+
+    df15["EMA50"] = EMA(
+        df15["Close"],
+        EMA_FAST
+    )
+
+    df15["EMA200"] = EMA(
+        df15["Close"],
+        EMA_TREND
+    )
+
+    df15["RSI"] = RSI(
+        df15["Close"],
+        RSI_PERIOD
+    )
+
+    df15["ATR"] = ATR(
+        df15,
+        ATR_PERIOD
+    )
+
+    df15["VOL_MA"] = (
+        df15["Volume"]
+        .rolling(VOLUME_PERIOD)
+        .mean()
+    )
+
+    return df1h, df15
+
+
+# ============================================================
+# 🔍 SIGNAL DETECTION
+# ============================================================
+
+def check_signal(
+    df1h,
+    df15,
+    time_index
+):
+
+    # Need enough history
+    if time_index not in df15.index:
+        return None
+
+    position = df15.index.get_loc(
+        time_index
+    )
+
+    if position < 250:
+        return None
+
+    # Last closed 15M candle
+    curr15 = df15.iloc[
+        position
+    ]
+
+    previous_time = (
+        df15.index[position - 1]
+    )
+
+    # --------------------------------------------------------
+    # Find corresponding 1H candle
+    # --------------------------------------------------------
+
+    available_1h = df1h[
+        df1h.index <= time_index
+    ]
+
+    if len(available_1h) < 250:
+        return None
+
+    curr1 = available_1h.iloc[-1]
+
+    # --------------------------------------------------------
+    # Build 4H
+    # --------------------------------------------------------
+
+    df4h = make_4h(
+        df1h.loc[
+            df1h.index <= time_index
+        ]
+    )
+
+    if len(df4h) < 220:
+        return None
+
+    df4h["EMA50"] = EMA(
+        df4h["Close"],
+        EMA_FAST
+    )
+
+    df4h["EMA200"] = EMA(
+        df4h["Close"],
+        EMA_TREND
+    )
+
+    last4 = df4h.iloc[-1]
+
+    # --------------------------------------------------------
+    # MAIN TREND
+    # --------------------------------------------------------
+
+    bullish_4h = (
+        last4["Close"] >
+        last4["EMA200"]
+        and
+        last4["EMA50"] >
+        last4["EMA200"]
+    )
+
+    bearish_4h = (
+        last4["Close"] <
+        last4["EMA200"]
+        and
+        last4["EMA50"] <
+        last4["EMA200"]
+    )
+
+    if not bullish_4h and not bearish_4h:
+        return None
+
+    # --------------------------------------------------------
+    # Previous 1H candle
+    # --------------------------------------------------------
+
+    pos1 = (
+        df1h.index.get_loc(
+            available_1h.index[-1]
+        )
+    )
+
+    if pos1 < 3:
+        return None
+
+    prev1 = df1h.iloc[
+        pos1 - 1
+    ]
+
+    # --------------------------------------------------------
+    # Breakout
+    # --------------------------------------------------------
+
+    bullish_breakout = (
+        curr1["Close"] >
+        curr1["PREV_HIGH"]
+        and
+        prev1["Close"] <=
+        prev1["PREV_HIGH"]
+    )
+
+    bearish_breakout = (
+        curr1["Close"] <
+        curr1["PREV_LOW"]
+        and
+        prev1["Close"] >=
+        prev1["PREV_LOW"]
+    )
+
+    recent_bull = (
+        df1h["Close"].iloc[
+            -3:
+        ]
+        >
+        df1h["PREV_HIGH"].iloc[
+            -3:
+        ]
+    ).any()
+
+    recent_bear = (
+        df1h["Close"].iloc[
+            -3:
+        ]
+        <
+        df1h["PREV_LOW"].iloc[
+            -3:
+        ]
+    ).any()
+
+    if bullish_4h:
+
+        if not (
+            bullish_breakout
+            or recent_bull
+        ):
+            return None
+
+        direction = "BUY"
+
+        breakout_level = float(
+            curr1["PREV_HIGH"]
+        )
+
+    else:
+
+        if not (
+            bearish_breakout
+            or recent_bear
+        ):
+            return None
+
+        direction = "SELL"
+
+        breakout_level = float(
+            curr1["PREV_LOW"]
+        )
+
+    # --------------------------------------------------------
+    # 15M retest
+    # --------------------------------------------------------
+
+    price = float(
+        curr15["Close"]
+    )
+
+    atr = float(
+        curr15["ATR"]
+    )
+
+    if atr <= 0:
+        return None
+
+    tolerance = (
+        atr *
+        RETEST_ATR_TOLERANCE
+    )
+
+    if direction == "BUY":
+
+        touched = (
+            curr15["Low"]
+            <=
+            breakout_level +
+            tolerance
+            and
+            curr15["Low"]
+            >=
+            breakout_level -
+            tolerance
+        )
+
+        reclaimed = (
+            price >
+            breakout_level
+        )
+
+    else:
+
+        touched = (
+            curr15["High"]
+            >=
+            breakout_level -
+            tolerance
+            and
+            curr15["High"]
+            <=
+            breakout_level +
+            tolerance
+        )
+
+        reclaimed = (
+            price <
+            breakout_level
+        )
+
+    if not touched or not reclaimed:
+        return None
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    score = 0
+
+    # 4H trend
+    score += 2
+
+    # 1H EMA alignment
+    if direction == "BUY":
+
+        if (
+            curr1["Close"] >
+            curr1["EMA200"]
+            and
+            curr1["EMA50"] >
+            curr1["EMA200"]
+        ):
+            score += 1
+
+    else:
+
+        if (
+            curr1["Close"] <
+            curr1["EMA200"]
+            and
+            curr1["EMA50"] <
+            curr1["EMA200"]
+        ):
+            score += 1
+
+    # Breakout
+    score += 2
+
+    # Retest
+    score += 1
+
+    # RSI
+    rsi = float(
+        curr15["RSI"]
+    )
+
+    if direction == "BUY":
+
+        if 50 <= rsi <= 72:
+            score += 1
+
+    else:
+
+        if 28 <= rsi <= 50:
+            score += 1
+
+    # Volume
+    volume_ok = (
+        curr1["Volume"]
+        >
+        curr1["VOL_MA"] *
+        VOLUME_MULTIPLIER
+    )
+
+    if volume_ok:
+        score += 1
+
+    # Candle
+    if direction == "BUY":
+
+        candle_ok = (
+            bullish_candle(
+                curr15
+            )
+        )
+
+    else:
+
+        candle_ok = (
+            bearish_candle(
+                curr15
+            )
+        )
+
+    if candle_ok:
+        score += 1
+
+    # Structure
+    structure_df = df1h.loc[
+        :available_1h.index[-1]
+    ].tail(10)
+
+    if direction == "BUY":
+
+        structure_ok = (
+            higher_high(
+                structure_df
+            )
+            and
+            higher_low(
+                structure_df
+            )
+        )
+
+    else:
+
+        structure_ok = (
+            lower_high(
+                structure_df
+            )
+            and
+            lower_low(
+                structure_df
+            )
+        )
+
+    if structure_ok:
+        score += 1
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
+
+    if score < MIN_SCORE:
+        return None
+
+    # --------------------------------------------------------
+    # ENTRY
+    # --------------------------------------------------------
+
+    entry = price
+
+    # Add small slippage
+    if direction == "BUY":
+
+        entry *= (
+            1 +
+            SLIPPAGE
+        )
+
+    else:
+
+        entry *= (
+            1 -
+            SLIPPAGE
+        )
+
+    # --------------------------------------------------------
+    # STOP LOSS
+    # --------------------------------------------------------
+
+    if direction == "BUY":
+
+        structural_sl = min(
+            float(curr15["Low"]),
+            breakout_level
+        )
+
+        sl = (
+            structural_sl -
+            atr *
+            ATR_SL_MULTIPLIER
+        )
+
+        risk = entry - sl
+
+        if risk <= 0:
+            return None
+
+        tp1 = entry + (
+            risk * TP1_R
+        )
+
+        tp2 = entry + (
+            risk * TP2_R
+        )
+
+        tp3 = entry + (
+            risk * TP3_R
+        )
+
+    else:
+
+        structural_sl = max(
+            float(curr15["High"]),
+            breakout_level
+        )
+
+        sl = (
+            structural_sl +
+            atr *
+            ATR_SL_MULTIPLIER
+        )
+
+        risk = sl - entry
+
+        if risk <= 0:
+            return None
+
+        tp1 = entry - (
+            risk * TP1_R
+        )
+
+        tp2 = entry - (
+            risk * TP2_R
+        )
+
+        tp3 = entry - (
+            risk * TP3_R
+        )
+
+    return {
+        "time": time_index,
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "risk": risk,
+        "score": score,
+        "rsi": rsi
+    }
+
+
+# ============================================================
+# 🎯 SIMULATE TRADE
+# ============================================================
+
+def simulate_trade(
+    df15,
+    signal,
+    start_position
+):
+
+    direction = signal["direction"]
+
+    entry = signal["entry"]
+    sl = signal["sl"]
+    tp1 = signal["tp1"]
+    tp2 = signal["tp2"]
+    tp3 = signal["tp3"]
+
+    end_position = min(
+        start_position +
+        MAX_TRADE_BARS,
+        len(df15) - 1
+    )
+
+    for i in range(
+        start_position + 1,
+        end_position + 1
+    ):
+
+        candle = df15.iloc[i]
+
+        high = float(
+            candle["High"]
+        )
+
+        low = float(
+            candle["Low"]
+        )
+
+        # ====================================================
+        # BUY
+        # ====================================================
+
+        if direction == "BUY":
+
+            # Conservative assumption:
+            # if TP and SL are both touched
+            # in the same candle,
+            # assume SL happened first.
+
+            if low <= sl:
+
+                return {
+                    "result": "LOSS",
+                    "R": -1.0,
+                    "exit": sl,
+                    "exit_time": df15.index[i]
+                }
+
+            if high >= tp3:
+
+                return {
+                    "result": "WIN",
+                    "R": TP3_R,
+                    "exit": tp3,
+                    "exit_time": df15.index[i]
+                }
+
+            if high >= tp2:
+
+                return {
+                    "result": "WIN",
+                    "R": TP2_R,
+                    "exit": tp2,
+                    "exit_time": df15.index[i]
+                }
+
+            if high >= tp1:
+
+                return {
+                    "result": "WIN",
+                    "R": TP1_R,
+                    "exit": tp1,
+                    "exit_time": df15.index[i]
+                }
+
+        # ====================================================
+        # SELL
+        # ====================================================
+
+        else:
+
+            if high >= sl:
+
+                return {
+                    "result": "LOSS",
+                    "R": -1.0,
+                    "exit": sl,
+                    "exit_time": df15.index[i]
+                }
+
+            if low <= tp3:
+
+                return {
+                    "result": "WIN",
+                    "R": TP3_R,
+                    "exit": tp3,
+                    "exit_time": df15.index[i]
+                }
+
+            if low <= tp2:
+
+                return {
+                    "result": "WIN",
+                    "R": TP2_R,
+                    "exit": tp2,
+                    "exit_time": df15.index[i]
+                }
+
+            if low <= tp1:
+
+                return {
+                    "result": "WIN",
+                    "R": TP1_R,
+                    "exit": tp1,
+                    "exit_time": df15.index[i]
+                }
+
+    # ========================================================
+    # TIME EXIT
+    # ========================================================
+
+    last = df15.iloc[
+        end_position
+    ]
+
+    exit_price = float(
+        last["Close"]
+    )
+
+    if direction == "BUY":
+
+        raw_r = (
+            exit_price -
+            entry
+        ) / (
+            entry -
+            sl
+        )
+
+    else:
+
+        raw_r = (
+            entry -
+            exit_price
+        ) / (
+            sl -
+            entry
+        )
+
+    return {
+        "result": "TIME_EXIT",
+        "R": raw_r,
+        "exit": exit_price,
+        "exit_time": df15.index[
+            end_position
+        ]
+    }
+
+
+# ============================================================
+# 💰 APPLY FEES
+# ============================================================
+
+def apply_fees(r_value):
+
+    # Approximate round-trip fee
+    fee_r = (
+        FEE_RATE * 2
+    )
+
+    return r_value - fee_r
+
+
+# ============================================================
+# 📊 BACKTEST ONE SYMBOL
+# ============================================================
+
+def backtest_symbol(
+    symbol,
+    df1h,
+    df15
+):
+
+    print(
+        f"\n🔬 Backtesting {symbol}"
+    )
+
+    df1h, df15 = prepare_data(
+        df1h,
+        df15
+    )
+
+    trades = []
+
+    start_position = 250
+
+    last_trade_end = -1
+
+    for i in range(
+        start_position,
+        len(df15) - 1
+    ):
+
+        # Avoid overlapping trades
+        if i <= last_trade_end:
+            continue
+
+        timestamp = df15.index[i]
+
+        signal = check_signal(
+            df1h,
+            df15,
+            timestamp
+        )
+
+        if signal is None:
+            continue
+
+        result = simulate_trade(
+            df15,
+            signal,
+            i
+        )
+
+        if result is None:
+            continue
+
+        final_r = apply_fees(
+            result["R"]
+        )
+
+        trade = {
+            "symbol": symbol,
+            "entry_time": signal["time"],
+            "direction": signal["direction"],
+            "score": signal["score"],
+            "entry": signal["entry"],
+            "sl": signal["sl"],
+            "tp1": signal["tp1"],
+            "tp2": signal["tp2"],
+            "tp3": signal["tp3"],
+            "exit": result["exit"],
+            "exit_time": result["exit_time"],
+            "result": result["result"],
+            "R": final_r
+        }
+
+        trades.append(
+            trade
+        )
+
+        last_trade_end = (
+            df15.index.get_loc(
+                result["exit_time"]
+            )
+        )
+
+    return trades
+
+
+# ============================================================
+# 📈 STATISTICS
+# ============================================================
+
+def calculate_statistics(
+    trades
+):
+
+    if not trades:
+
+        return {
+            "Trades": 0,
+            "Wins": 0,
+            "Losses": 0,
+            "Win Rate %": 0,
+            "Profit Factor": 0,
+            "Net R": 0,
+            "Average R": 0,
+            "Max Drawdown R": 0,
+            "Max Consecutive Losses": 0
+        }
+
+    r_values = [
+        float(
+            t["R"]
+        )
+        for t in trades
+    ]
+
+    wins = [
+        r
+        for r in r_values
+        if r > 0
+    ]
+
+    losses = [
+        r
+        for r in r_values
+        if r < 0
+    ]
+
+    total_trades = len(
+        r_values
+    )
+
+    win_count = len(
+        wins
+    )
+
+    loss_count = len(
+        losses
+    )
+
+    win_rate = (
+        win_count /
+        total_trades *
+        100
+    )
+
+    gross_profit = sum(
+        wins
+    )
+
+    gross_loss = abs(
+        sum(losses)
+    )
+
+    if gross_loss > 0:
+
+        profit_factor = (
+            gross_profit /
+            gross_loss
+        )
+
+    else:
+
+        profit_factor = float(
+            "inf"
+        )
+
+    net_r = sum(
+        r_values
+    )
+
+    average_r = (
+        net_r /
+        total_trades
+    )
+
+    # ========================================================
+    # EQUITY CURVE
+    # ========================================================
+
+    equity = 0
+
+    peak = 0
+
+    max_drawdown = 0
+
+    current_losses = 0
+
+    max_consecutive_losses = 0
+
+    for r in r_values:
+
+        equity += r
+
+        peak = max(
+            peak,
+            equity
+        )
+
+        drawdown = (
+            peak -
+            equity
+        )
+
+        max_drawdown = max(
+            max_drawdown,
+            drawdown
+        )
+
+        if r < 0:
+
+            current_losses += 1
+
+            max_consecutive_losses = max(
+                max_consecutive_losses,
+                current_losses
+            )
+
+        else:
+
+            current_losses = 0
+
+    return {
+        "Trades": total_trades,
+        "Wins": win_count,
+        "Losses": loss_count,
+        "Win Rate %": round(
+            win_rate,
+            2
+        ),
+        "Profit Factor": round(
+            profit_factor,
+            3
+        ),
+        "Net R": round(
+            net_r,
+            3
+        ),
+        "Average R": round(
+            average_r,
+            3
+        ),
+        "Max Drawdown R": round(
+            max_drawdown,
+            3
+        ),
+        "Max Consecutive Losses":
+            max_consecutive_losses
+    }
+
+
+# ============================================================
+# 🚀 MAIN BACKTEST
+# ============================================================
+
+def main():
+
+    print("=" * 75)
+
+    print(
+        "🚀 CRYPTO STRATEGY BACKTEST V5"
+    )
+
+    print(
+        "4H TREND + 1H BREAKOUT + "
+        "15M RETEST"
+    )
+
+    print(
+        f"📅 Backtest period: "
+        f"{BACKTEST_DAYS} days"
+    )
+
+    print(
+        f"💰 Initial balance: "
+        f"${INITIAL_BALANCE:,.2f}"
+    )
+
+    print(
+        f"⚠️ Risk per trade: "
+        f"{RISK_PERCENT}%"
+    )
+
+    print("=" * 75)
+
+    end_dt = datetime.now(
+        timezone.utc
+    )
+
+    start_dt = (
+        end_dt -
+        pd.Timedelta(
+            days=BACKTEST_DAYS
+        )
+    )
+
+    start_ms = int(
+        start_dt.timestamp() *
+        1000
+    )
+
+    end_ms = int(
+        end_dt.timestamp() *
+        1000
+    )
+
+    all_trades = []
+
+    symbol_results = []
+
+    for index, symbol in enumerate(
+        SYMBOLS,
+        1
+    ):
+
+        print(
+            f"\n{'=' * 60}"
+        )
+
+        print(
+            f"[{index}/{len(SYMBOLS)}] "
+            f"{symbol}"
+        )
+
+        # ----------------------------------------------------
+        # Download 1H
+        # ----------------------------------------------------
+
+        df1h = get_klines(
+            symbol,
+            TF_1H,
+            start_ms,
+            end_ms
+        )
+
+        if df1h is None:
+
+            print(
+                "❌ No 1H data"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Download 15M
+        # ----------------------------------------------------
+
+        df15 = get_klines(
+            symbol,
+            TF_15M,
+            start_ms,
+            end_ms
+        )
+
+        if df15 is None:
+
+            print(
+                "❌ No 15M data"
+            )
+
+            continue
+
+        print(
+            f"📊 1H candles: "
+            f"{len(df1h)}"
+        )
+
+        print(
+            f"📊 15M candles: "
+            f"{len(df15)}"
+        )
+
+        # ----------------------------------------------------
+        # Backtest
+        # ----------------------------------------------------
+
+        trades = backtest_symbol(
+            symbol,
+            df1h,
+            df15
+        )
+
+        all_trades.extend(
+            trades
+        )
+
+        stats = calculate_statistics(
+            trades
+        )
+
+        symbol_results.append(
+            {
+                "Symbol": symbol,
+                **stats
+            }
+        )
+
+        print(
+            f"📈 Trades: "
+            f"{stats['Trades']}"
+        )
+
+        print(
+            f"🎯 Win Rate: "
+            f"{stats['Win Rate %']}%"
+        )
+
+        print(
+            f"💰 Profit Factor: "
+            f"{stats['Profit Factor']}"
+        )
+
+        print(
+            f"📊 Net R: "
+            f"{stats['Net R']}"
+        )
+
+        print(
+            f"📉 Max DD: "
+            f"{stats['Max Drawdown R']}R"
+        )
+
+        time.sleep(
+            0.5
+        )
+
+    # ========================================================
+    # SAVE TRADES
+    # ========================================================
+
+    if all_trades:
+
+        trades_df = pd.DataFrame(
+            all_trades
+        )
+
+        trades_df.to_csv(
+            "backtest_trades.csv",
+            index=False
+        )
+
+        print(
+            "\n💾 Saved: "
+            "backtest_trades.csv"
+        )
+
+    # ========================================================
+    # SAVE SYMBOL RESULTS
+    # ========================================================
+
+    results_df = pd.DataFrame(
+        symbol_results
+    )
+
+    if not results_df.empty:
+
+        results_df = results_df.sort_values(
+            by="Net R",
+            ascending=False
+        )
+
+        results_df.to_csv(
+            "backtest_results.csv",
+            index=False
+        )
+
+        print(
+            "💾 Saved: "
+            "backtest_results.csv"
+        )
+
+    # ========================================================
+    # GLOBAL RESULTS
+    # ========================================================
+
+    global_stats = calculate_statistics(
+        all_trades
+    )
+
+    print(
+        "\n\n"
+        + "=" * 75
+    )
+
+    print(
+        "🏆 GLOBAL BACKTEST RESULTS"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    for key, value in global_stats.items():
+
+        print(
+            f"{key}: {value}"
+        )
+
+    # ========================================================
+    # BUY / SELL
+    # ========================================================
+
+    if all_trades:
+
+        buy_trades = [
+            t for t in all_trades
+            if t["direction"] == "BUY"
+        ]
+
+        sell_trades = [
+            t for t in all_trades
+            if t["direction"] == "SELL"
+        ]
+
+        buy_stats = calculate_statistics(
+            buy_trades
+        )
+
+        sell_stats = calculate_statistics(
+            sell_trades
+        )
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            "🟢 BUY RESULTS"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        for key, value in buy_stats.items():
+
+            print(
+                f"{key}: {value}"
+            )
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            "🔴 SELL RESULTS"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        for key, value in sell_stats.items():
+
+            print(
+                f"{key}: {value}"
+            )
+
+    # ========================================================
+    # TOP 10
+    # ========================================================
+
+    if not results_df.empty:
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            "🥇 TOP 10 SYMBOLS"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        print(
+            results_df.head(10).to_string(
+                index=False
+            )
+        )
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            "💀 WORST 10 SYMBOLS"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        print(
+            results_df.tail(10).sort_values(
+                by="Net R"
+            ).to_string(
+                index=False
+            )
+        )
+
+    print(
+        "\n"
+        + "=" * 75
+    )
+
+    print(
+        "✅ BACKTEST COMPLETED"
+    )
+
+    print(
+        "=" * 75
+    )
+
+
+# ============================================================
+# START
 # ============================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🚀 CRYPTO SIGNAL BOT V3 (GITHUB ACTIONS EDITION)")
-    print(f"🪙 SYMBOLS: {len(SYMBOLS)}")
-    print("=" * 60)
-    scan()
-    print("\n✅ Scan completed.")
 
+    main()
