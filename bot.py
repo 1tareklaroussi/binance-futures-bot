@@ -1,23 +1,39 @@
-import os
+hereimport os
 import json
+import time
 import logging
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-TIMEFRAME = "5m"
-PERIOD = "5d"
+if not TWELVE_DATA_API_KEY:
+    raise RuntimeError("TWELVE_DATA_API_KEY is missing")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
+if not TELEGRAM_CHAT_ID:
+    raise RuntimeError("TELEGRAM_CHAT_ID is missing")
+
+
+BASE_URL = "https://api.twelvedata.com/time_series"
+
+TIMEFRAME = "5min"
+
+# Number of candles requested from Twelve Data.
+# 500 candles = enough for EMA/RSI/ATR calculations.
+OUTPUT_SIZE = 500
 
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -37,23 +53,27 @@ TRADES_FILE = "data/trades.json"
 MODEL_FILE = "data/model.json"
 
 
-SYMBOLS = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
-    "XRP-USD", "DOGE-USD", "ADA-USD", "AVAX-USD",
-    "LINK-USD", "DOT-USD", "MATIC-USD", "LTC-USD",
-    "SHIB-USD", "TRX-USD", "BCH-USD", "NEAR-USD",
-    "UNI-USD", "ATOM-USD", "XLM-USD", "XMR-USD",
-    "ETC-USD", "ICP-USD", "FIL-USD", "HBAR-USD",
-    "VET-USD", "APT-USD", "OP-USD", "ARB-USD",
-    "INJ-USD", "RNDR-USD", "FTM-USD", "SUI-USD",
-    "SEI-USD", "GALA-USD", "SAND-USD", "MANA-USD",
-    "AAVE-USD", "SNX-USD", "MKR-USD", "AXS-USD",
-    "TIA-USD", "TAO-USD", "KAS-USD", "STX-USD",
-    "IMX-USD", "PEPE-USD", "WIF-USD", "BONK-USD",
-    "FLOKI-USD", "JUP-USD", "PYTH-USD", "RUNE-USD",
-    "ALGO-USD", "EGLD-USD", "QNT-USD", "EOS-USD",
-    "XTZ-USD", "FLOW-USD", "THETA-USD", "CRV-USD",
-    "LDO-USD", "COMP-USD", "ZEC-USD", "DASH-USD"
+# ============================================================
+# SYMBOLS
+# ============================================================
+
+# Twelve Data crypto symbols use BTC/USD format.
+# We keep the same coins but convert automatically.
+
+RAW_SYMBOLS = [
+    "BTC", "ETH", "SOL", "BNB", "XRP",
+    "DOGE", "ADA", "AVAX", "LINK", "DOT",
+    "MATIC", "LTC", "SHIB", "TRX", "BCH",
+    "NEAR", "UNI", "ATOM", "XLM", "XMR",
+    "ETC", "ICP", "FIL", "HBAR", "VET",
+    "APT", "OP", "ARB", "INJ", "RNDR",
+    "FTM", "SUI", "SEI", "GALA", "SAND",
+    "MANA", "AAVE", "SNX", "MKR", "AXS",
+    "TIA", "TAO", "KAS", "STX", "IMX",
+    "PEPE", "WIF", "BONK", "FLOKI", "JUP",
+    "PYTH", "RUNE", "ALGO", "EGLD", "QNT",
+    "EOS", "XTZ", "FLOW", "THETA", "CRV",
+    "LDO", "COMP", "ZEC", "DASH"
 ]
 
 
@@ -68,7 +88,7 @@ logging.basicConfig(
 
 
 # ============================================================
-# FILES
+# FILE MANAGEMENT
 # ============================================================
 
 def ensure_files():
@@ -76,31 +96,41 @@ def ensure_files():
     os.makedirs("data", exist_ok=True)
 
     if not os.path.exists(TRADES_FILE):
+
         with open(TRADES_FILE, "w") as f:
             json.dump([], f)
 
     if not os.path.exists(MODEL_FILE):
+
         with open(MODEL_FILE, "w") as f:
-            json.dump({
-                "volume_multiplier": BASE_VOLUME_MULTIPLIER,
-                "approved": False,
-                "last_update": None
-            }, f, indent=2)
+
+            json.dump(
+                {
+                    "volume_multiplier": BASE_VOLUME_MULTIPLIER,
+                    "approved": False,
+                    "last_update": None
+                },
+                f,
+                indent=2
+            )
 
 
 def load_json(path, default):
 
     try:
+
         with open(path, "r") as f:
             return json.load(f)
 
     except Exception:
+
         return default
 
 
 def save_json(path, data):
 
     with open(path, "w") as f:
+
         json.dump(
             data,
             f,
@@ -121,7 +151,7 @@ def telegram(message):
 
     try:
 
-        r = requests.post(
+        response = requests.post(
             url,
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -131,7 +161,7 @@ def telegram(message):
             timeout=20
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
         logging.info("Telegram message sent")
 
@@ -140,6 +170,150 @@ def telegram(message):
         logging.error(
             f"Telegram error: {e}"
         )
+
+
+# ============================================================
+# TWELVE DATA
+# ============================================================
+
+def get_data(symbol):
+
+    params = {
+        "symbol": f"{symbol}/USD",
+        "interval": TIMEFRAME,
+        "outputsize": OUTPUT_SIZE,
+        "apikey": TWELVE_DATA_API_KEY
+    }
+
+    for attempt in range(3):
+
+        try:
+
+            response = requests.get(
+                BASE_URL,
+                params=params,
+                timeout=20
+            )
+
+            data = response.json()
+
+            if response.status_code == 429:
+
+                logging.warning(
+                    f"{symbol}: Twelve Data rate limit. "
+                    f"Waiting..."
+                )
+
+                time.sleep(15)
+                continue
+
+            if data.get("status") == "error":
+
+                logging.warning(
+                    f"{symbol}: "
+                    f"{data.get('message', 'Unknown error')}"
+                )
+
+                return None
+
+            values = data.get("values")
+
+            if not values:
+
+                logging.warning(
+                    f"{symbol}: no data returned"
+                )
+
+                return None
+
+            df = pd.DataFrame(values)
+
+            required = [
+                "datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume"
+            ]
+
+            if not all(
+                column in df.columns
+                for column in required
+            ):
+
+                logging.warning(
+                    f"{symbol}: missing OHLCV columns"
+                )
+
+                return None
+
+            df["datetime"] = pd.to_datetime(
+                df["datetime"],
+                errors="coerce"
+            )
+
+            df = df.set_index(
+                "datetime"
+            )
+
+            rename = {
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume"
+            }
+
+            df = df.rename(
+                columns=rename
+            )
+
+            for column in [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]:
+
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce"
+                )
+
+            df.dropna(
+                inplace=True
+            )
+
+            df.sort_index(
+                inplace=True
+            )
+
+            # Remove currently forming candle.
+            if len(df) > 2:
+                df = df.iloc[:-1]
+
+            if len(df) < 100:
+
+                logging.warning(
+                    f"{symbol}: insufficient candles"
+                )
+
+                return None
+
+            return df
+
+        except Exception as e:
+
+            logging.warning(
+                f"{symbol}: request error "
+                f"(attempt {attempt + 1}/3): {e}"
+            )
+
+            time.sleep(5)
+
+    return None
 
 
 # ============================================================
@@ -186,19 +360,29 @@ def rsi(series, period=14):
 
     return (
         100 -
-        100 / (1 + rs)
+        (100 / (1 + rs))
     ).fillna(50)
 
 
 def atr(df, period=14):
 
-    previous = df["Close"].shift(1)
+    previous_close = (
+        df["Close"].shift(1)
+    )
 
     tr = pd.concat(
         [
             df["High"] - df["Low"],
-            (df["High"] - previous).abs(),
-            (df["Low"] - previous).abs()
+
+            (
+                df["High"] -
+                previous_close
+            ).abs(),
+
+            (
+                df["Low"] -
+                previous_close
+            ).abs()
         ],
         axis=1
     ).max(axis=1)
@@ -217,27 +401,27 @@ def add_vwap(df):
 
     df = df.copy()
 
-    typical = (
+    typical_price = (
         df["High"] +
         df["Low"] +
         df["Close"]
     ) / 3
 
-    dates = df.index.date
+    session = df.index.date
 
     pv = (
-        typical *
+        typical_price *
         df["Volume"]
     )
 
     cumulative_pv = (
-        pv.groupby(dates)
+        pv.groupby(session)
         .cumsum()
     )
 
     cumulative_volume = (
         df["Volume"]
-        .groupby(dates)
+        .groupby(session)
         .cumsum()
     )
 
@@ -250,118 +434,47 @@ def add_vwap(df):
 
 
 # ============================================================
-# DATA
+# BUILD INDICATORS
 # ============================================================
 
-def get_data(symbol):
+def prepare_data(df):
 
-    try:
+    df = df.copy()
 
-        df = yf.download(
-            symbol,
-            period=PERIOD,
-            interval=TIMEFRAME,
-            progress=False,
-            auto_adjust=False,
-            threads=False
-        )
+    df["EMA9"] = ema(
+        df["Close"],
+        EMA_FAST
+    )
 
-        if df is None or df.empty:
-            return None
+    df["EMA21"] = ema(
+        df["Close"],
+        EMA_SLOW
+    )
 
-        if isinstance(
-            df.columns,
-            pd.MultiIndex
-        ):
+    df["EMA50"] = ema(
+        df["Close"],
+        EMA_TREND
+    )
 
-            df.columns = [
-                c[0]
-                for c in df.columns
-            ]
+    df["RSI"] = rsi(
+        df["Close"],
+        RSI_PERIOD
+    )
 
-        required = [
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
+    df["ATR"] = atr(
+        df,
+        ATR_PERIOD
+    )
 
-        if not all(
-            x in df.columns
-            for x in required
-        ):
+    df["VOL_MA"] = (
+        df["Volume"]
+        .rolling(20)
+        .mean()
+    )
 
-            return None
+    df = add_vwap(df)
 
-        df = df[required].copy()
-
-        for c in required:
-
-            df[c] = pd.to_numeric(
-                df[c],
-                errors="coerce"
-            )
-
-        df.dropna(
-            inplace=True
-        )
-
-        df.sort_index(
-            inplace=True
-        )
-
-        # Ignore currently forming candle
-        if len(df) > 2:
-            df = df.iloc[:-1]
-
-        if len(df) < 100:
-            return None
-
-        # Indicators
-
-        df["EMA9"] = ema(
-            df["Close"],
-            EMA_FAST
-        )
-
-        df["EMA21"] = ema(
-            df["Close"],
-            EMA_SLOW
-        )
-
-        df["EMA50"] = ema(
-            df["Close"],
-            EMA_TREND
-        )
-
-        df["RSI"] = rsi(
-            df["Close"],
-            RSI_PERIOD
-        )
-
-        df["ATR"] = atr(
-            df,
-            ATR_PERIOD
-        )
-
-        df["VOL_MA"] = (
-            df["Volume"]
-            .rolling(20)
-            .mean()
-        )
-
-        df = add_vwap(df)
-
-        return df
-
-    except Exception as e:
-
-        logging.error(
-            f"{symbol}: {e}"
-        )
-
-        return None
+    return df
 
 
 # ============================================================
@@ -406,61 +519,75 @@ def adaptive_volume():
 
 
 # ============================================================
-# SIGNAL
+# SIGNAL ENGINE
 # ============================================================
 
-def signal(df):
+def generate_signal(df):
 
     if len(df) < 60:
         return None
 
-    c = df.iloc[-1]
-    p = df.iloc[-2]
+    df = prepare_data(df)
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
 
     volume_multiplier = (
         adaptive_volume()
     )
 
-    volume_ok = (
-        c["Volume"] >
-        c["VOL_MA"] *
+    volume_ratio = (
+        current["Volume"] /
+        current["VOL_MA"]
+    )
+
+    volume_confirmed = (
+        volume_ratio >=
         volume_multiplier
     )
 
     bullish_cross = (
-        p["EMA9"] <= p["EMA21"]
+        previous["EMA9"]
+        <= previous["EMA21"]
         and
-        c["EMA9"] > c["EMA21"]
+        current["EMA9"]
+        > current["EMA21"]
     )
 
     bearish_cross = (
-        p["EMA9"] >= p["EMA21"]
+        previous["EMA9"]
+        >= previous["EMA21"]
         and
-        c["EMA9"] < c["EMA21"]
+        current["EMA9"]
+        < current["EMA21"]
     )
 
     buy = (
         bullish_cross
         and
-        c["Close"] > c["VWAP"]
+        current["Close"]
+        > current["VWAP"]
         and
-        c["Close"] > c["EMA50"]
+        current["Close"]
+        > current["EMA50"]
         and
-        52 <= c["RSI"] <= 70
+        52 <= current["RSI"] <= 70
         and
-        volume_ok
+        volume_confirmed
     )
 
     sell = (
         bearish_cross
         and
-        c["Close"] < c["VWAP"]
+        current["Close"]
+        < current["VWAP"]
         and
-        c["Close"] < c["EMA50"]
+        current["Close"]
+        < current["EMA50"]
         and
-        30 <= c["RSI"] <= 48
+        30 <= current["RSI"] <= 48
         and
-        volume_ok
+        volume_confirmed
     )
 
     if not buy and not sell:
@@ -473,12 +600,12 @@ def signal(df):
         "SELL"
     )
 
-    price = float(
-        c["Close"]
+    entry = float(
+        current["Close"]
     )
 
     current_atr = float(
-        c["ATR"]
+        current["ATR"]
     )
 
     if current_atr <= 0:
@@ -491,36 +618,53 @@ def signal(df):
 
     if direction == "BUY":
 
-        sl = price - risk
+        sl = entry - risk
 
         tp = (
-            price +
+            entry +
             risk * TP_R
         )
 
     else:
 
-        sl = price + risk
+        sl = entry + risk
 
         tp = (
-            price -
+            entry -
             risk * TP_R
         )
 
     return {
-        "direction": direction,
-        "entry": price,
-        "sl": sl,
-        "tp": tp,
-        "rsi": float(c["RSI"]),
-        "volume_ratio": float(
-            c["Volume"] /
-            c["VOL_MA"]
-        ),
-        "atr": current_atr,
-        "time": str(
-            df.index[-1]
-        )
+
+        "direction":
+            direction,
+
+        "entry":
+            entry,
+
+        "sl":
+            sl,
+
+        "tp":
+            tp,
+
+        "rsi":
+            float(
+                current["RSI"]
+            ),
+
+        "volume_ratio":
+            float(
+                volume_ratio
+            ),
+
+        "atr":
+            current_atr,
+
+        "time":
+            str(
+                df.index[-1]
+            )
     }
 
 
@@ -534,13 +678,13 @@ def already_signaled(
     signal_time
 ):
 
-    for t in trades:
+    for trade in trades:
 
         if (
-            t.get("symbol")
+            trade.get("symbol")
             == symbol
             and
-            t.get("signal_time")
+            trade.get("signal_time")
             == signal_time
         ):
 
@@ -560,6 +704,7 @@ def record_signal(
 ):
 
     trade = {
+
         "id":
             f"{symbol}_{sig['time']}",
 
@@ -604,25 +749,21 @@ def record_signal(
         trade
     )
 
-    return trade
-
 
 # ============================================================
-# CHECK OLD OPEN TRADES
+# UPDATE OPEN TRADES
 # ============================================================
 
-def update_open_trades(
-    trades
-):
+def update_open_trades(trades):
 
     changed = False
 
     for trade in trades:
 
-        if trade.get(
-            "status"
-        ) != "OPEN":
-
+        if (
+            trade.get("status")
+            != "OPEN"
+        ):
             continue
 
         df = get_data(
@@ -656,26 +797,18 @@ def update_open_trades(
             trade["tp"]
         )
 
-        risk = abs(
-            float(
-                trade["entry"]
-            ) - sl
-        )
-
-        for _, row in future.iterrows():
+        for _, candle in future.iterrows():
 
             high = float(
-                row["High"]
+                candle["High"]
             )
 
             low = float(
-                row["Low"]
+                candle["Low"]
             )
 
             if direction == "BUY":
 
-                # Conservative:
-                # SL first if both hit
                 if low <= sl:
 
                     trade["status"] = "CLOSED"
@@ -724,8 +857,9 @@ def update_open_trades(
 def learn(trades):
 
     closed = [
-        t for t in trades
-        if t.get("status")
+        trade
+        for trade in trades
+        if trade.get("status")
         == "CLOSED"
     ]
 
@@ -734,14 +868,16 @@ def learn(trades):
         return None
 
     wins = [
-        t for t in closed
-        if t.get("result")
+        trade
+        for trade in closed
+        if trade.get("result")
         == "WIN"
     ]
 
     losses = [
-        t for t in closed
-        if t.get("result")
+        trade
+        for trade in closed
+        if trade.get("result")
         == "LOSS"
     ]
 
@@ -751,25 +887,25 @@ def learn(trades):
     gross_profit = sum(
         max(
             0,
-            float(t["R"])
+            float(trade["R"])
         )
-        for t in closed
+        for trade in closed
     )
 
     gross_loss = abs(
         sum(
             min(
                 0,
-                float(t["R"])
+                float(trade["R"])
             )
-            for t in closed
+            for trade in closed
         )
     )
 
     if gross_loss <= 0:
         return None
 
-    pf = (
+    profit_factor = (
         gross_profit /
         gross_loss
     )
@@ -780,14 +916,11 @@ def learn(trades):
         * 100
     )
 
-    # --------------------------------------------------------
-    # Analyze volume
-    # --------------------------------------------------------
-
     high_volume = [
-        t for t in closed
+        trade
+        for trade in closed
         if float(
-            t.get(
+            trade.get(
                 "volume_ratio",
                 0
             )
@@ -795,36 +928,37 @@ def learn(trades):
     ]
 
     low_volume = [
-        t for t in closed
+        trade
+        for trade in closed
         if float(
-            t.get(
+            trade.get(
                 "volume_ratio",
                 0
             )
         ) < 1.35
     ]
 
-    def wr(group):
+    def group_winrate(group):
 
         if not group:
             return 0
 
         return (
             sum(
-                t["result"]
+                x["result"]
                 == "WIN"
-                for t in group
+                for x in group
             )
             /
             len(group)
             * 100
         )
 
-    high_wr = wr(
+    high_wr = group_winrate(
         high_volume
     )
 
-    low_wr = wr(
+    low_wr = group_winrate(
         low_volume
     )
 
@@ -837,12 +971,7 @@ def learn(trades):
         )
     )
 
-    # --------------------------------------------------------
-    # Adaptive rule
-    #
-    # Only consider changing after
-    # enough historical trades.
-    # --------------------------------------------------------
+    proposed = old_multiplier
 
     if (
         len(high_volume) >= 30
@@ -852,10 +981,6 @@ def learn(trades):
     ):
 
         proposed = 1.35
-
-    else:
-
-        proposed = old_multiplier
 
     changed = (
         proposed !=
@@ -884,6 +1009,7 @@ def learn(trades):
         )
 
     return {
+
         "trades":
             len(closed),
 
@@ -899,9 +1025,9 @@ def learn(trades):
                 2
             ),
 
-        "pf":
+        "profit_factor":
             round(
-                pf,
+                profit_factor,
                 3
             ),
 
@@ -929,26 +1055,26 @@ def learn(trades):
 
 
 # ============================================================
-# REPORT
+# TELEGRAM REPORT
 # ============================================================
 
-def make_report(
+def build_report(
     signals,
     learning
 ):
 
     message = (
-        "⚡ <b>ADAPTIVE SCALPING BOT</b>\n\n"
-        "📡 Yahoo Finance\n"
+        "⚡ <b>ADAPTIVE SCALPING V3</b>\n\n"
+        "📡 Twelve Data\n"
         "⏱️ 5M\n"
-        "🧠 EMA9/21 + VWAP + RSI + Volume\n\n"
+        "🧠 EMA9/21 + VWAP + RSI + Volume\n"
     )
 
     if signals:
 
         message += (
-            "━━━━━━━━━━━━━━━━━━\n"
-            "🚨 <b>NEW SIGNALS</b>\n"
+            "\n━━━━━━━━━━━━━━━━━━\n"
+            "🚨 <b>NEW SIGNAL</b>\n"
         )
 
         for symbol, sig in signals:
@@ -961,56 +1087,84 @@ def make_report(
             )
 
             message += (
-                f"\n{icon} <b>{symbol}</b>\n"
-                f"Direction: <b>{sig['direction']}</b>\n"
-                f"Entry: {sig['entry']:.8g}\n"
-                f"SL: {sig['sl']:.8g}\n"
-                f"TP: {sig['tp']:.8g}\n"
-                f"RSI: {sig['rsi']:.2f}\n"
-                f"Volume: {sig['volume_ratio']:.2f}x\n"
+
+                f"\n{icon} "
+                f"<b>{symbol}/USD</b>\n"
+
+                f"Direction: "
+                f"<b>{sig['direction']}</b>\n"
+
+                f"Entry: "
+                f"{sig['entry']:.8g}\n"
+
+                f"SL: "
+                f"{sig['sl']:.8g}\n"
+
+                f"TP: "
+                f"{sig['tp']:.8g}\n"
+
+                f"RSI: "
+                f"{sig['rsi']:.2f}\n"
+
+                f"Volume: "
+                f"{sig['volume_ratio']:.2f}x\n"
+
                 f"RR: 1:{TP_R:.2f}\n"
             )
+
+    else:
+
+        message += (
+            "\n⚪ No new signals."
+        )
 
     if learning:
 
         message += (
-            "\n━━━━━━━━━━━━━━━━━━\n"
-            "🧠 <b>LEARNING</b>\n\n"
 
-            f"Trades: {learning['trades']}\n"
-            f"Wins: {learning['wins']}\n"
-            f"Losses: {learning['losses']}\n"
-            f"Win Rate: {learning['win_rate']}%\n"
-            f"Profit Factor: {learning['pf']}\n\n"
+            "\n\n━━━━━━━━━━━━━━━━━━\n"
+
+            "🧠 <b>LEARNING REPORT</b>\n\n"
+
+            f"Trades: "
+            f"{learning['trades']}\n"
+
+            f"Wins: "
+            f"{learning['wins']}\n"
+
+            f"Losses: "
+            f"{learning['losses']}\n"
+
+            f"Win Rate: "
+            f"{learning['win_rate']}%\n"
+
+            f"Profit Factor: "
+            f"{learning['profit_factor']}\n\n"
 
             f"Volume ≥ 1.35x: "
             f"{learning['high_volume_wr']}% WR\n"
 
             f"Volume < 1.35x: "
-            f"{learning['low_volume_wr']}% WR\n\n"
+            f"{learning['low_volume_wr']}% WR\n"
         )
 
         if learning["changed"]:
 
             message += (
-                "🟢 <b>ADAPTIVE UPDATE</b>\n"
+
+                "\n🟢 <b>ADAPTIVE UPDATE</b>\n"
+
                 f"Volume filter: "
                 f"{learning['old_multiplier']}x"
                 " → "
-                f"{learning['new_multiplier']}x\n"
+                f"{learning['new_multiplier']}x"
             )
 
         else:
 
             message += (
-                "⚪ No parameter update.\n"
+                "\n⚪ No parameter update."
             )
-
-    if not signals and not learning:
-
-        message += (
-            "⚪ No new signals.\n"
-        )
 
     return message
 
@@ -1024,7 +1178,15 @@ def main():
     ensure_files()
 
     logging.info(
-        "🚀 Adaptive Scalping Bot started"
+        "🚀 Adaptive Scalping V3 started"
+    )
+
+    logging.info(
+        "📡 Data source: Twelve Data"
+    )
+
+    logging.info(
+        f"⏱️ Timeframe: {TIMEFRAME}"
     )
 
     trades = load_json(
@@ -1048,7 +1210,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # 2. Learn
+    # 2. Learning
     # --------------------------------------------------------
 
     learning = learn(
@@ -1061,7 +1223,11 @@ def main():
 
     signals = []
 
-    for symbol in SYMBOLS:
+    for symbol in RAW_SYMBOLS:
+
+        logging.info(
+            f"🔍 Checking {symbol}/USD"
+        )
 
         df = get_data(
             symbol
@@ -1070,7 +1236,7 @@ def main():
         if df is None:
             continue
 
-        sig = signal(
+        sig = generate_signal(
             df
         )
 
@@ -1098,8 +1264,12 @@ def main():
             )
         )
 
+        # Small delay to be gentle
+        # with API limits.
+        time.sleep(0.15)
+
     # --------------------------------------------------------
-    # 4. Save
+    # 4. Save memory
     # --------------------------------------------------------
 
     save_json(
@@ -1111,13 +1281,11 @@ def main():
     # 5. Telegram
     # --------------------------------------------------------
 
-    message = make_report(
-        signals,
-        learning
-    )
-
     telegram(
-        message
+        build_report(
+            signals,
+            learning
+        )
     )
 
     logging.info(
