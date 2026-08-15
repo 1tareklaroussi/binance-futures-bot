@@ -1,18 +1,28 @@
 # bot.py
-# V5 - 1H Crypto Signal Bot
-# MACD + Price Action + Trend + OB + FVG + Fibonacci/GZ
-# + Volume Profile + Box + Risk Management + Telegram
+# V5.1 — 1H Crypto Signal Bot
+# MACD + Price Action + Trend + OB + FVG
+# + Fibonacci/GZ + Volume Profile + Box + Risk
+# + Telegram
 #
-# Required GitHub Secrets:
+# GitHub Secrets:
 # TELEGRAM_BOT_TOKEN
 # TELEGRAM_CHAT_ID
+#
+# Binance API Key is NOT required.
 
 import os
 import time
 import logging
-import requests
+from typing import Optional
+
 import numpy as np
 import pandas as pd
+import requests
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 BINANCE_BASE = "https://data-api.binance.vision"
 TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
@@ -20,21 +30,51 @@ TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
 TIMEFRAME = "1h"
 CANDLE_LIMIT = 500
 
+# Minimum score required to send a signal
 MIN_SCORE = 70
+
+# Strong signal
 STRONG_SCORE = 80
 
-ATR_PERIOD = 14
-RR1 = 2.0
-RR2 = 3.0
-SL_ATR_BUFFER = 0.20
-
+# Maximum number of coins scanned
 MAX_SYMBOLS = 80
-MIN_24H_QUOTE_VOLUME = 10_000_000
-REQUEST_TIMEOUT = 15
 
+# Minimum 24h USDT volume
+MIN_24H_QUOTE_VOLUME = 10_000_000
+
+# HTTP
+REQUEST_TIMEOUT = 15
+RETRIES = 3
+REQUEST_DELAY = 0.15
+
+# MACD
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+# Trend
+EMA_FAST = 20
+EMA_SLOW = 50
+
+# ATR / Risk
+ATR_PERIOD = 14
+SL_ATR_BUFFER = 0.20
+
+RR1 = 2.0
+RR2 = 3.0
+
+# Analysis
+SWING_LOOKBACK = 50
+VP_LOOKBACK = 100
+BOX_LOOKBACK = 30
+
+# Duplicate protection
+SENT_FILE = "sent_signals.txt"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,55 +82,85 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-session.headers.update({"User-Agent": "CryptoSignalBot/5.0"})
+
+session.headers.update({
+    "User-Agent": "CryptoSignalBot/5.1"
+})
 
 
 # ============================================================
 # HTTP
 # ============================================================
 
-def get_json(url, params=None, retries=3):
+def get_json(url, params=None):
+
     last_error = None
 
-    for attempt in range(retries):
+    for attempt in range(RETRIES):
+
         try:
+
             response = session.get(
                 url,
                 params=params,
                 timeout=REQUEST_TIMEOUT
             )
+
             response.raise_for_status()
+
             return response.json()
 
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1))
+        except Exception as exc:
 
-    raise RuntimeError(f"HTTP error: {last_error}")
+            last_error = exc
+
+            logging.warning(
+                f"Request failed "
+                f"({attempt + 1}/{RETRIES}): {exc}"
+            )
+
+            time.sleep(
+                1.5 * (attempt + 1)
+            )
+
+    raise RuntimeError(
+        f"HTTP error: {last_error}"
+    )
 
 
 # ============================================================
-# BINANCE DATA
+# BINANCE SYMBOLS
 # ============================================================
 
 def get_symbols():
+
     data = get_json(
         f"{BINANCE_BASE}/api/v3/exchangeInfo"
     )
 
     symbols = []
 
-    for s in data.get("symbols", []):
+    for item in data.get("symbols", []):
 
         if (
-            s.get("status") == "TRADING"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("isSpotTradingAllowed", True)
+            item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get(
+                "isSpotTradingAllowed",
+                True
+            )
         ):
-            symbols.append(s["symbol"])
+
+            symbols.append(
+                item["symbol"]
+            )
 
     return symbols
 
+
+# ============================================================
+# 24H VOLUME
+# ============================================================
 
 def get_24h_tickers():
 
@@ -100,22 +170,40 @@ def get_24h_tickers():
 
     result = {}
 
-    for x in data:
+    for item in data:
 
         try:
-            result[x["symbol"]] = {
-                "quote_volume": float(x["quoteVolume"]),
-                "price": float(x["lastPrice"]),
-                "change_pct": float(x["priceChangePercent"])
+
+            result[item["symbol"]] = {
+                "quote_volume":
+                    float(item["quoteVolume"]),
+
+                "price":
+                    float(item["lastPrice"]),
+
+                "change_pct":
+                    float(item["priceChangePercent"])
             }
 
-        except Exception:
+        except (
+            KeyError,
+            TypeError,
+            ValueError
+        ):
+
             continue
 
     return result
 
 
-def get_klines(symbol, limit=CANDLE_LIMIT):
+# ============================================================
+# OHLCV
+# ============================================================
+
+def get_klines(
+    symbol,
+    limit=CANDLE_LIMIT
+):
 
     data = get_json(
         f"{BINANCE_BASE}/api/v3/klines",
@@ -141,7 +229,10 @@ def get_klines(symbol, limit=CANDLE_LIMIT):
         "ignore"
     ]
 
-    df = pd.DataFrame(data, columns=columns)
+    df = pd.DataFrame(
+        data,
+        columns=columns
+    )
 
     numeric_columns = [
         "open",
@@ -156,6 +247,7 @@ def get_klines(symbol, limit=CANDLE_LIMIT):
     ]
 
     for col in numeric_columns:
+
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce"
@@ -173,44 +265,97 @@ def get_klines(symbol, limit=CANDLE_LIMIT):
         utc=True
     )
 
-    # لا نستخدم الشمعة الحالية غير المغلقة
-    now = pd.Timestamp.now(tz="UTC")
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+    )
 
-    if (
-        len(df) > 0
-        and df.iloc[-1]["close_time"] > now
-    ):
-        df = df.iloc[:-1].copy()
+    df = df.reset_index(
+        drop=True
+    )
 
-    return df.reset_index(drop=True)
+    # ========================================================
+    # IMPORTANT:
+    # Remove current unfinished candle.
+    # ========================================================
+
+    if len(df) > 0:
+
+        now = pd.Timestamp.now(
+            tz="UTC"
+        )
+
+        if (
+            df.iloc[-1]["close_time"]
+            > now
+        ):
+
+            df = df.iloc[:-1].copy()
+
+    return df.reset_index(
+        drop=True
+    )
 
 
 # ============================================================
-# INDICATORS
+# EMA
 # ============================================================
 
-def EMA(series, period):
+def EMA(
+    series,
+    period
+):
+
     return series.ewm(
         span=period,
         adjust=False
     ).mean()
 
 
-def ATR(df, period=ATR_PERIOD):
+# ============================================================
+# ATR
+# ============================================================
 
-    previous_close = df["close"].shift(1)
+def ATR(
+    df,
+    period=ATR_PERIOD
+):
+
+    previous_close = (
+        df["close"].shift(1)
+    )
 
     tr = pd.concat(
         [
             df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs()
+
+            (
+                df["high"]
+                - previous_close
+            ).abs(),
+
+            (
+                df["low"]
+                - previous_close
+            ).abs()
         ],
         axis=1
     ).max(axis=1)
 
-    return tr.rolling(period).mean()
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
 
+
+# ============================================================
+# MACD
+# ============================================================
 
 def MACD(df):
 
@@ -231,7 +376,10 @@ def MACD(df):
         MACD_SIGNAL
     )
 
-    histogram = macd_line - signal_line
+    histogram = (
+        macd_line
+        - signal_line
+    )
 
     return (
         macd_line,
@@ -242,136 +390,246 @@ def MACD(df):
 
 # ============================================================
 # MACD CROSSOVER
+# PRIMARY SIGNAL
 # ============================================================
 
 def macd_signal(df):
 
-    macd_line, signal_line, histogram = MACD(df)
-
     if len(df) < 50:
+
         return None, 0
 
-    previous_macd = macd_line.iloc[-2]
-    previous_signal = signal_line.iloc[-2]
-
-    current_macd = macd_line.iloc[-1]
-    current_signal = signal_line.iloc[-1]
-
-    bullish_cross = (
-        previous_macd <= previous_signal
-        and current_macd > current_signal
+    macd_line, signal_line, histogram = MACD(
+        df
     )
 
+    previous_macd = (
+        macd_line.iloc[-2]
+    )
+
+    previous_signal = (
+        signal_line.iloc[-2]
+    )
+
+    current_macd = (
+        macd_line.iloc[-1]
+    )
+
+    current_signal = (
+        signal_line.iloc[-1]
+    )
+
+    # Bullish crossover
+    bullish_cross = (
+        previous_macd
+        <= previous_signal
+        and
+        current_macd
+        > current_signal
+    )
+
+    # Bearish crossover
     bearish_cross = (
-        previous_macd >= previous_signal
-        and current_macd < current_signal
+        previous_macd
+        >= previous_signal
+        and
+        current_macd
+        < current_signal
     )
 
     if bullish_cross:
+
         return "LONG", 25
 
     if bearish_cross:
+
         return "SHORT", 25
 
     return None, 0
 
 
 # ============================================================
-# PRICE ACTION
+# CANDLE HELPERS
 # ============================================================
 
 def candle_body(c):
-    return abs(c["close"] - c["open"])
+
+    return abs(
+        c["close"]
+        - c["open"]
+    )
 
 
 def candle_range(c):
+
     return max(
-        c["high"] - c["low"],
+        c["high"]
+        - c["low"],
         1e-12
     )
 
 
-def bullish_engulfing(previous, current):
+# ============================================================
+# ENGULFING
+# ============================================================
+
+def bullish_engulfing(
+    previous,
+    current
+):
 
     return (
-        previous["close"] < previous["open"]
-        and current["close"] > current["open"]
-        and current["open"] <= previous["close"]
-        and current["close"] >= previous["open"]
+        previous["close"]
+        < previous["open"]
+        and
+        current["close"]
+        > current["open"]
+        and
+        current["open"]
+        <= previous["close"]
+        and
+        current["close"]
+        >= previous["open"]
     )
 
 
-def bearish_engulfing(previous, current):
+def bearish_engulfing(
+    previous,
+    current
+):
 
     return (
-        previous["close"] > previous["open"]
-        and current["close"] < current["open"]
-        and current["open"] >= previous["close"]
-        and current["close"] <= previous["open"]
+        previous["close"]
+        > previous["open"]
+        and
+        current["close"]
+        < current["open"]
+        and
+        current["open"]
+        >= previous["close"]
+        and
+        current["close"]
+        <= previous["open"]
     )
 
 
-def pin_bar(candle, bullish=True):
+# ============================================================
+# PIN BAR
+# ============================================================
 
-    body = candle_body(candle)
-    rng = candle_range(candle)
+def pin_bar(
+    candle,
+    bullish=True
+):
+
+    body = candle_body(
+        candle
+    )
+
+    rng = candle_range(
+        candle
+    )
 
     upper_wick = (
         candle["high"]
-        - max(candle["open"], candle["close"])
+        - max(
+            candle["open"],
+            candle["close"]
+        )
     )
 
     lower_wick = (
-        min(candle["open"], candle["close"])
+        min(
+            candle["open"],
+            candle["close"]
+        )
         - candle["low"]
     )
 
     if body / rng > 0.35:
+
         return False
 
     if bullish:
+
         return (
             lower_wick >= body * 2
-            and lower_wick >= upper_wick * 1.5
+            and
+            lower_wick
+            >= upper_wick * 1.5
         )
 
     return (
         upper_wick >= body * 2
-        and upper_wick >= lower_wick * 1.5
+        and
+        upper_wick
+        >= lower_wick * 1.5
     )
 
+
+# ============================================================
+# PRICE ACTION
+# ============================================================
 
 def price_action_signal(df):
 
     if len(df) < 10:
+
         return None, 0
 
     previous = df.iloc[-2]
     current = df.iloc[-1]
 
     bullish = (
-        bullish_engulfing(previous, current)
-        or pin_bar(current, True)
+        bullish_engulfing(
+            previous,
+            current
+        )
+        or
+        pin_bar(
+            current,
+            True
+        )
     )
 
     bearish = (
-        bearish_engulfing(previous, current)
-        or pin_bar(current, False)
+        bearish_engulfing(
+            previous,
+            current
+        )
+        or
+        pin_bar(
+            current,
+            False
+        )
     )
 
-    recent_high = df["high"].iloc[-7:-1].max()
-    recent_low = df["low"].iloc[-7:-1].min()
+    recent_high = (
+        df["high"]
+        .iloc[-7:-1]
+        .max()
+    )
+
+    recent_low = (
+        df["low"]
+        .iloc[-7:-1]
+        .min()
+    )
 
     if current["close"] > recent_high:
+
         bullish = True
 
     if current["close"] < recent_low:
+
         bearish = True
 
     if bullish and not bearish:
+
         return "LONG", 15
 
     if bearish and not bullish:
+
         return "SHORT", 15
 
     return None, 0
@@ -384,36 +642,49 @@ def price_action_signal(df):
 def trend_signal(df):
 
     if len(df) < 80:
+
         return None, 0
 
     ema20 = EMA(
         df["close"],
-        20
+        EMA_FAST
     )
 
     ema50 = EMA(
         df["close"],
-        50
+        EMA_SLOW
     )
 
-    price = df["close"].iloc[-1]
+    price = (
+        df["close"].iloc[-1]
+    )
 
     bullish = (
         price > ema20.iloc[-1]
-        and ema20.iloc[-1] > ema50.iloc[-1]
-        and ema20.iloc[-1] > ema20.iloc[-6]
+        and
+        ema20.iloc[-1]
+        > ema50.iloc[-1]
+        and
+        ema20.iloc[-1]
+        > ema20.iloc[-6]
     )
 
     bearish = (
         price < ema20.iloc[-1]
-        and ema20.iloc[-1] < ema50.iloc[-1]
-        and ema20.iloc[-1] < ema20.iloc[-6]
+        and
+        ema20.iloc[-1]
+        < ema50.iloc[-1]
+        and
+        ema20.iloc[-1]
+        < ema20.iloc[-6]
     )
 
     if bullish:
+
         return "LONG", 15
 
     if bearish:
+
         return "SHORT", 15
 
     return None, 0
@@ -426,27 +697,42 @@ def trend_signal(df):
 def trendline_signal(df):
 
     if len(df) < 30:
+
         return None, 0
 
     highs = df["high"].iloc[-20:]
     lows = df["low"].iloc[-20:]
 
+    x = np.arange(
+        len(highs)
+    )
+
     high_slope = np.polyfit(
-        np.arange(len(highs)),
+        x,
         highs.values,
         1
     )[0]
 
     low_slope = np.polyfit(
-        np.arange(len(lows)),
+        x,
         lows.values,
         1
     )[0]
 
-    if high_slope > 0 and low_slope > 0:
+    if (
+        high_slope > 0
+        and
+        low_slope > 0
+    ):
+
         return "LONG", 5
 
-    if high_slope < 0 and low_slope < 0:
+    if (
+        high_slope < 0
+        and
+        low_slope < 0
+    ):
+
         return "SHORT", 5
 
     return None, 0
@@ -458,156 +744,338 @@ def trendline_signal(df):
 
 def order_block_signal(df):
 
-    if len(df) < 20:
+    if len(df) < 30:
+
         return None, 0, None
 
-    recent = df.iloc[-12:]
+    recent = df.iloc[-15:]
+
+    atr_value = ATR(
+        df
+    ).iloc[-1]
+
+    if (
+        not np.isfinite(atr_value)
+        or
+        atr_value <= 0
+    ):
+
+        return None, 0, None
 
     current = df.iloc[-1]
 
-    for i in range(len(recent) - 3, 0, -1):
+    # Search backwards for the last opposite candle
+    # before an impulsive move.
+    for i in range(
+        len(recent) - 3,
+        0,
+        -1
+    ):
 
         candle = recent.iloc[i]
-        next_candles = recent.iloc[i + 1:]
 
-        move_up = (
-            next_candles["close"].max()
+        future = recent.iloc[
+            i + 1:
+        ]
+
+        if len(future) == 0:
+
+            continue
+
+        future_high = (
+            future["high"].max()
+        )
+
+        future_low = (
+            future["low"].min()
+        )
+
+        upward_move = (
+            future_high
             - candle["high"]
         )
 
-        move_down = (
+        downward_move = (
             candle["low"]
-            - next_candles["close"].min()
+            - future_low
         )
 
-        # Bullish OB = last bearish candle before strong rise
+        # Bullish OB
         if candle["close"] < candle["open"]:
 
-            if move_up > ATR(df).iloc[-1] * 1.2:
+            if upward_move >= atr_value * 1.2:
 
-                if (
-                    current["low"] <= candle["high"]
-                    and current["high"] >= candle["low"]
-                ):
+                zone = (
+                    float(candle["low"]),
+                    float(candle["high"])
+                )
+
+                touched = (
+                    current["low"]
+                    <= zone[1]
+                    and
+                    current["high"]
+                    >= zone[0]
+                )
+
+                if touched:
+
                     return (
                         "LONG",
                         10,
-                        (candle["low"], candle["high"])
+                        zone
                     )
 
-        # Bearish OB = last bullish candle before strong fall
+        # Bearish OB
         if candle["close"] > candle["open"]:
 
-            if move_down > ATR(df).iloc[-1] * 1.2:
+            if downward_move >= atr_value * 1.2:
 
-                if (
-                    current["high"] >= candle["low"]
-                    and current["low"] <= candle["high"]
-                ):
+                zone = (
+                    float(candle["low"]),
+                    float(candle["high"])
+                )
+
+                touched = (
+                    current["high"]
+                    >= zone[0]
+                    and
+                    current["low"]
+                    <= zone[1]
+                )
+
+                if touched:
+
                     return (
                         "SHORT",
                         10,
-                        (candle["low"], candle["high"])
+                        zone
                     )
 
     return None, 0, None
 
 
 # ============================================================
-# FVG
+# FAIR VALUE GAP
 # ============================================================
 
 def fvg_signal(df):
 
     if len(df) < 10:
+
         return None, 0, None
 
-    # Three-candle FVG
     a = df.iloc[-3]
     b = df.iloc[-2]
     c = df.iloc[-1]
 
-    # Bullish FVG: candle A high < candle C low
+    # Bullish FVG:
+    # first candle high < third candle low
     if a["high"] < c["low"]:
 
         zone = (
-            a["high"],
-            c["low"]
+            float(a["high"]),
+            float(c["low"])
         )
 
-        if (
-            c["low"] <= zone[1]
-            and c["high"] >= zone[0]
-        ):
-            return "LONG", 10, zone
+        return (
+            "LONG",
+            10,
+            zone
+        )
 
-    # Bearish FVG: candle A low > candle C high
+    # Bearish FVG:
+    # first candle low > third candle high
     if a["low"] > c["high"]:
 
         zone = (
-            c["high"],
-            a["low"]
+            float(c["high"]),
+            float(a["low"])
         )
 
-        if (
-            c["high"] >= zone[0]
-            and c["low"] <= zone[1]
-        ):
-            return "SHORT", 10, zone
+        return (
+            "SHORT",
+            10,
+            zone
+        )
 
     return None, 0, None
 
 
 # ============================================================
-# FIBONACCI / GOLDEN ZONE
+# FIBONACCI + GOLDEN ZONE
 # ============================================================
 
 def fibonacci_signal(df):
 
-    if len(df) < 50:
+    if len(df) < SWING_LOOKBACK:
+
         return None, 0, None
 
-    window = df.iloc[-50:]
+    window = df.iloc[
+        -SWING_LOOKBACK:
+    ]
 
-    swing_high = window["high"].max()
-    swing_low = window["low"].min()
+    swing_high = float(
+        window["high"].max()
+    )
 
-    current = df["close"].iloc[-1]
+    swing_low = float(
+        window["low"].min()
+    )
 
-    diff = swing_high - swing_low
+    current = float(
+        df["close"].iloc[-1]
+    )
 
-    if diff <= 0:
+    diff = (
+        swing_high
+        - swing_low
+    )
+
+    if (
+        diff <= 0
+        or
+        not np.isfinite(diff)
+    ):
+
         return None, 0, None
 
-    # Retracement levels
+    # IMPORTANT:
+    # Use explicit numeric calculations.
+    # This fixes the previous KeyError: '0.5'.
+
+    fib_382 = (
+        swing_high
+        - diff * 0.382
+    )
+
+    fib_500 = (
+        swing_high
+        - diff * 0.500
+    )
+
+    fib_618 = (
+        swing_high
+        - diff * 0.618
+    )
+
+    fib_650 = (
+        swing_high
+        - diff * 0.650
+    )
+
+    fib_786 = (
+        swing_high
+        - diff * 0.786
+    )
+
     levels = {
-        "0.382": swing_high - diff * 0.382,
-        "0.500": swing_high - diff * 0.500,
-        "0.618": swing_high - diff * 0.618,
-        "0.650": swing_high - diff * 0.650,
-        "0.786": swing_high - diff * 0.786
+        "0.382": fib_382,
+        "0.500": fib_500,
+        "0.618": fib_618,
+        "0.650": fib_650,
+        "0.786": fib_786
     }
 
+    # 2.5% tolerance of the swing range
     tolerance = diff * 0.025
 
-    # Golden zone
-    if (
-        abs(current - levels["0.618"]) <= tolerance
-        or abs(current - levels["0.650"]) <= tolerance
-    ):
-        if current > swing_low + diff * 0.5:
-            return "LONG", 10, levels
+    # ========================================================
+    # GOLDEN ZONE
+    # ========================================================
 
-        return "SHORT", 10, levels
+    golden_zone = (
+        abs(
+            current - fib_618
+        ) <= tolerance
+        or
+        abs(
+            current - fib_650
+        ) <= tolerance
+    )
 
-    for name, level in levels.items():
+    if golden_zone:
 
-        if abs(current - level) <= tolerance:
+        if current >= fib_500:
 
-            if current > levels["0.5"]:
-                return "LONG", 8, levels
+            return (
+                "LONG",
+                10,
+                levels
+            )
 
-            return "SHORT", 8, levels
+        return (
+            "SHORT",
+            10,
+            levels
+        )
+
+    # ========================================================
+    # 0.382
+    # ========================================================
+
+    if abs(
+        current - fib_382
+    ) <= tolerance:
+
+        if current >= fib_500:
+
+            return (
+                "LONG",
+                8,
+                levels
+            )
+
+        return (
+            "SHORT",
+            8,
+            levels
+        )
+
+    # ========================================================
+    # 0.500
+    # ========================================================
+
+    if abs(
+        current - fib_500
+    ) <= tolerance:
+
+        if current >= fib_500:
+
+            return (
+                "LONG",
+                8,
+                levels
+            )
+
+        return (
+            "SHORT",
+            8,
+            levels
+        )
+
+    # ========================================================
+    # 0.786
+    # ========================================================
+
+    if abs(
+        current - fib_786
+    ) <= tolerance:
+
+        if current >= fib_500:
+
+            return (
+                "LONG",
+                8,
+                levels
+            )
+
+        return (
+            "SHORT",
+            8,
+            levels
+        )
 
     return None, 0, levels
 
@@ -618,15 +1086,24 @@ def fibonacci_signal(df):
 
 def volume_profile_signal(df):
 
-    if len(df) < 100:
+    if len(df) < VP_LOOKBACK:
+
         return None, 0, None
 
-    data = df.iloc[-100:].copy()
+    data = df.iloc[
+        -VP_LOOKBACK:
+    ].copy()
 
-    price_min = data["low"].min()
-    price_max = data["high"].max()
+    price_min = float(
+        data["low"].min()
+    )
+
+    price_max = float(
+        data["high"].max()
+    )
 
     if price_max <= price_min:
+
         return None, 0, None
 
     bins = np.linspace(
@@ -641,23 +1118,34 @@ def volume_profile_signal(df):
 
     for _, row in data.iterrows():
 
-        price = (
+        typical_price = (
             row["high"]
             + row["low"]
             + row["close"]
         ) / 3
 
-        index = np.searchsorted(
-            bins,
-            price,
-            side="right"
-        ) - 1
+        index = (
+            np.searchsorted(
+                bins,
+                typical_price,
+                side="right"
+            )
+            - 1
+        )
 
-        if 0 <= index < len(volume_profile):
-            volume_profile[index] += row["volume"]
+        if (
+            0 <= index
+            < len(volume_profile)
+        ):
+
+            volume_profile[index] += (
+                row["volume"]
+            )
 
     poc_index = int(
-        np.argmax(volume_profile)
+        np.argmax(
+            volume_profile
+        )
     )
 
     poc = (
@@ -665,63 +1153,119 @@ def volume_profile_signal(df):
         + bins[poc_index + 1]
     ) / 2
 
-    current = df["close"].iloc[-1]
+    current = float(
+        df["close"].iloc[-1]
+    )
 
     tolerance = (
-        price_max - price_min
+        price_max
+        - price_min
     ) * 0.03
 
-    if current > poc and abs(current - poc) <= tolerance:
-        return "LONG", 10, poc
+    if (
+        current > poc
+        and
+        abs(current - poc)
+        <= tolerance
+    ):
 
-    if current < poc and abs(current - poc) <= tolerance:
-        return "SHORT", 10, poc
+        return (
+            "LONG",
+            10,
+            poc
+        )
+
+    if (
+        current < poc
+        and
+        abs(current - poc)
+        <= tolerance
+    ):
+
+        return (
+            "SHORT",
+            10,
+            poc
+        )
 
     return None, 0, poc
 
 
 # ============================================================
-# BOX / SUPPORT RESISTANCE
+# BOX / RANGE BREAKOUT
 # ============================================================
 
 def box_signal(df):
 
-    if len(df) < 30:
+    if len(df) < BOX_LOOKBACK:
+
         return None, 0, None
 
-    data = df.iloc[-30:]
+    data = df.iloc[
+        -BOX_LOOKBACK:
+    ]
 
-    resistance = data["high"].iloc[:-1].max()
-    support = data["low"].iloc[:-1].min()
+    previous = data.iloc[:-1]
 
-    current = df["close"].iloc[-1]
+    resistance = float(
+        previous["high"].max()
+    )
 
-    atr_value = ATR(df).iloc[-1]
+    support = float(
+        previous["low"].min()
+    )
 
-    if pd.isna(atr_value):
-        return None, 0, None
+    current = float(
+        df["close"].iloc[-1]
+    )
 
-    # Breakout above box
     if current > resistance:
-        return "LONG", 5, (support, resistance)
 
-    # Breakout below box
+        return (
+            "LONG",
+            5,
+            (support, resistance)
+        )
+
     if current < support:
-        return "SHORT", 5, (support, resistance)
 
-    return None, 0, (support, resistance)
+        return (
+            "SHORT",
+            5,
+            (support, resistance)
+        )
+
+    return (
+        None,
+        0,
+        (support, resistance)
+    )
 
 
 # ============================================================
-# RISK / SL / TP
+# RISK MANAGEMENT
 # ============================================================
 
-def calculate_risk(df, direction, ob_zone=None):
+def calculate_risk(
+    df,
+    direction,
+    ob_zone=None
+):
 
-    current = float(df["close"].iloc[-1])
-    atr_value = float(ATR(df).iloc[-1])
+    current = float(
+        df["close"].iloc[-1]
+    )
 
-    if not np.isfinite(atr_value) or atr_value <= 0:
+    atr_value = float(
+        ATR(df).iloc[-1]
+    )
+
+    if (
+        not np.isfinite(atr_value)
+        or
+        atr_value <= 0
+    ):
+
         return None
 
     recent = df.iloc[-20:]
@@ -736,45 +1280,75 @@ def calculate_risk(df, direction, ob_zone=None):
 
     if direction == "LONG":
 
-        candidates = [
-            swing_low - atr_value * SL_ATR_BUFFER
+        stop_candidates = [
+            swing_low
+            - atr_value * SL_ATR_BUFFER
         ]
 
-        if ob_zone:
-            candidates.append(
-                ob_zone[0] - atr_value * SL_ATR_BUFFER
+        if ob_zone is not None:
+
+            stop_candidates.append(
+                ob_zone[0]
+                - atr_value * SL_ATR_BUFFER
             )
 
-        sl = min(candidates)
+        sl = min(
+            stop_candidates
+        )
 
-        risk = current - sl
+        risk = (
+            current - sl
+        )
 
         if risk <= 0:
+
             return None
 
-        tp1 = current + risk * RR1
-        tp2 = current + risk * RR2
+        tp1 = (
+            current
+            + risk * RR1
+        )
+
+        tp2 = (
+            current
+            + risk * RR2
+        )
 
     else:
 
-        candidates = [
-            swing_high + atr_value * SL_ATR_BUFFER
+        stop_candidates = [
+            swing_high
+            + atr_value * SL_ATR_BUFFER
         ]
 
-        if ob_zone:
-            candidates.append(
-                ob_zone[1] + atr_value * SL_ATR_BUFFER
+        if ob_zone is not None:
+
+            stop_candidates.append(
+                ob_zone[1]
+                + atr_value * SL_ATR_BUFFER
             )
 
-        sl = max(candidates)
+        sl = max(
+            stop_candidates
+        )
 
-        risk = sl - current
+        risk = (
+            sl - current
+        )
 
         if risk <= 0:
+
             return None
 
-        tp1 = current - risk * RR1
-        tp2 = current - risk * RR2
+        tp1 = (
+            current
+            - risk * RR1
+        )
+
+        tp2 = (
+            current
+            - risk * RR2
+        )
 
     return {
         "entry": current,
@@ -788,81 +1362,139 @@ def calculate_risk(df, direction, ob_zone=None):
 
 
 # ============================================================
-# SCORE ENGINE
+# ANALYSIS / SCORE
 # ============================================================
 
-def analyze(symbol, df):
+def analyze(
+    symbol,
+    df
+):
 
     if len(df) < 120:
+
         return None
 
     components = {}
 
-    macd_dir, macd_points = macd_signal(df)
-    trend_dir, trend_points = trend_signal(df)
-    trendline_dir, trendline_points = trendline_signal(df)
-    pa_dir, pa_points = price_action_signal(df)
+    # Primary signal
+    macd_dir, macd_points = (
+        macd_signal(df)
+    )
 
-    ob_dir, ob_points, ob_zone = order_block_signal(df)
-    fvg_dir, fvg_points, fvg_zone = fvg_signal(df)
-    fib_dir, fib_points, fib_levels = fibonacci_signal(df)
-    vp_dir, vp_points, poc = volume_profile_signal(df)
-    box_dir, box_points, box_zone = box_signal(df)
+    # Do not waste analysis if there
+    # is no MACD crossover.
+    if macd_dir is None:
 
-    components["MACD"] = (macd_dir, macd_points)
-    components["Trend"] = (trend_dir, trend_points)
+        return None
+
+    trend_dir, trend_points = (
+        trend_signal(df)
+    )
+
+    trendline_dir, trendline_points = (
+        trendline_signal(df)
+    )
+
+    pa_dir, pa_points = (
+        price_action_signal(df)
+    )
+
+    ob_dir, ob_points, ob_zone = (
+        order_block_signal(df)
+    )
+
+    fvg_dir, fvg_points, fvg_zone = (
+        fvg_signal(df)
+    )
+
+    fib_dir, fib_points, fib_levels = (
+        fibonacci_signal(df)
+    )
+
+    vp_dir, vp_points, poc = (
+        volume_profile_signal(df)
+    )
+
+    box_dir, box_points, box_zone = (
+        box_signal(df)
+    )
+
+    components["MACD"] = (
+        macd_dir,
+        macd_points
+    )
+
+    components["Trend"] = (
+        trend_dir,
+        trend_points
+    )
+
     components["Trend Line"] = (
         trendline_dir,
         trendline_points
     )
+
     components["Price Action"] = (
         pa_dir,
         pa_points
     )
+
     components["Order Block"] = (
         ob_dir,
         ob_points
     )
+
     components["FVG"] = (
         fvg_dir,
         fvg_points
     )
+
     components["Fibonacci"] = (
         fib_dir,
         fib_points
     )
+
     components["Volume Profile"] = (
         vp_dir,
         vp_points
     )
+
     components["Box"] = (
         box_dir,
         box_points
     )
 
-    # MACD must be the primary trigger.
-    if macd_dir is None:
-        return None
+    # ========================================================
+    # Score only the MACD direction.
+    # ========================================================
 
     long_score = 0
     short_score = 0
 
-    for name, (direction, points) in components.items():
+    for direction, points in (
+        components.values()
+    ):
 
         if direction == "LONG":
+
             long_score += points
 
         elif direction == "SHORT":
+
             short_score += points
 
     if macd_dir == "LONG":
-        score = long_score
+
         direction = "LONG"
+        score = long_score
+
     else:
-        score = short_score
+
         direction = "SHORT"
+        score = short_score
 
     if score < MIN_SCORE:
+
         return None
 
     risk = calculate_risk(
@@ -872,6 +1504,7 @@ def analyze(symbol, df):
     )
 
     if risk is None:
+
         return None
 
     return {
@@ -902,9 +1535,16 @@ def send_telegram(message):
         "TELEGRAM_CHAT_ID"
     )
 
-    if not token or not chat_id:
+    if not token:
+
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing."
+            "TELEGRAM_BOT_TOKEN is missing."
+        )
+
+    if not chat_id:
+
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID is missing."
         )
 
     response = requests.post(
@@ -921,21 +1561,32 @@ def send_telegram(message):
     response.raise_for_status()
 
 
+# ============================================================
+# PRICE FORMAT
+# ============================================================
+
 def fmt_price(value):
 
     value = float(value)
 
     if value >= 1000:
+
         return f"{value:,.2f}"
 
     if value >= 1:
+
         return f"{value:.4f}"
 
     if value >= 0.01:
+
         return f"{value:.6f}"
 
     return f"{value:.8f}"
 
+
+# ============================================================
+# TELEGRAM MESSAGE
+# ============================================================
 
 def format_signal(signal):
 
@@ -944,37 +1595,57 @@ def format_signal(signal):
     score = signal["score"]
     risk = signal["risk"]
 
-    emoji = (
-        "🟢 LONG"
-        if direction == "LONG"
-        else "🔴 SHORT"
-    )
+    if direction == "LONG":
 
-    strength = (
-        "🔥 STRONG"
-        if score >= STRONG_SCORE
-        else "✅ VALID"
-    )
+        emoji = "🟢 LONG"
+
+    else:
+
+        emoji = "🔴 SHORT"
+
+    if score >= STRONG_SCORE:
+
+        strength = "🔥 STRONG"
+
+    else:
+
+        strength = "✅ VALID"
 
     lines = [
+
         "━━━━━━━━━━━━━━━━━━━━",
+
         f"{emoji} | {strength}",
+
         "📊 <b>1H CRYPTO SIGNAL</b>",
+
         "━━━━━━━━━━━━━━━━━━━━",
+
         f"🪙 <b>{symbol}</b>",
+
         f"⭐ Score: <b>{score}/100</b>",
+
         "",
+
         "📌 <b>ENTRY / RISK</b>",
+
         f"Entry: {fmt_price(risk['entry'])}",
+
         f"SL: {fmt_price(risk['sl'])}",
+
         f"TP1: {fmt_price(risk['tp1'])}",
+
         f"TP2: {fmt_price(risk['tp2'])}",
+
         f"R:R: 1:{RR1:g} / 1:{RR2:g}",
+
         "",
+
         "🔍 <b>CONFIRMATIONS</b>"
     ]
 
     names = [
+
         "MACD",
         "Trend",
         "Trend Line",
@@ -984,19 +1655,28 @@ def format_signal(signal):
         "Fibonacci",
         "Volume Profile",
         "Box"
+
     ]
 
     for name in names:
 
-        direction_result, points = signal[
+        result = signal[
             "components"
         ][name]
 
+        direction_result = result[0]
+        points = result[1]
+
         if direction_result == direction:
+
             mark = "✅"
+
         elif direction_result is None:
+
             mark = "⚪"
+
         else:
+
             mark = "❌"
 
         lines.append(
@@ -1005,11 +1685,19 @@ def format_signal(signal):
 
     lines.extend(
         [
+
             "",
-            f"🕐 Candle: {signal['candle_time']}",
+
+            f"🕐 Candle: "
+            f"{signal['candle_time']}",
+
             "",
-            "⚠️ Signal only — not financial advice.",
+
+            "⚠️ Signal only — "
+            "not financial advice.",
+
             "━━━━━━━━━━━━━━━━━━━━"
+
         ]
     )
 
@@ -1020,24 +1708,31 @@ def format_signal(signal):
 # DUPLICATE PROTECTION
 # ============================================================
 
-SENT_FILE = "sent_signals.txt"
-
-
 def load_sent():
 
-    if not os.path.exists(SENT_FILE):
+    if not os.path.exists(
+        SENT_FILE
+    ):
+
         return set()
 
-    with open(
-        SENT_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        return {
-            line.strip()
-            for line in f
-            if line.strip()
-        }
+    try:
+
+        with open(
+            SENT_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return {
+                line.strip()
+                for line in file
+                if line.strip()
+            }
+
+    except Exception:
+
+        return set()
 
 
 def save_sent(key):
@@ -1046,34 +1741,46 @@ def save_sent(key):
         SENT_FILE,
         "a",
         encoding="utf-8"
-    ) as f:
-        f.write(key + "\n")
+    ) as file:
+
+        file.write(
+            key + "\n"
+        )
 
 
 # ============================================================
-# MAIN SCANNER
+# MAIN
 # ============================================================
 
 def main():
 
-    logging.info("🚀 Starting V5 1H scanner")
+    logging.info(
+        "🚀 Starting V5.1 1H scanner"
+    )
 
     sent = load_sent()
 
     symbols = get_symbols()
+
     tickers = get_24h_tickers()
 
-    # Select the most liquid USDT pairs.
     candidates = []
 
     for symbol in symbols:
 
-        info = tickers.get(symbol)
+        info = tickers.get(
+            symbol
+        )
 
-        if not info:
+        if info is None:
+
             continue
 
-        if info["quote_volume"] < MIN_24H_QUOTE_VOLUME:
+        if (
+            info["quote_volume"]
+            < MIN_24H_QUOTE_VOLUME
+        ):
+
             continue
 
         candidates.append(
@@ -1084,23 +1791,38 @@ def main():
         )
 
     candidates.sort(
-        key=lambda x: x[1],
+        key=lambda item: item[1],
         reverse=True
     )
 
-    candidates = candidates[:MAX_SYMBOLS]
+    candidates = candidates[
+        :MAX_SYMBOLS
+    ]
 
     logging.info(
-        f"🔎 Scanning {len(candidates)} liquid USDT pairs"
+        f"🔎 Scanning "
+        f"{len(candidates)} "
+        f"liquid USDT pairs"
     )
 
-    found = []
+    signals_sent = 0
 
     for symbol, _ in candidates:
 
         try:
 
-            df = get_klines(symbol)
+            df = get_klines(
+                symbol
+            )
+
+            if len(df) < 120:
+
+                logging.warning(
+                    f"{symbol}: "
+                    f"not enough candles"
+                )
+
+                continue
 
             signal = analyze(
                 symbol,
@@ -1108,6 +1830,7 @@ def main():
             )
 
             if signal is None:
+
                 continue
 
             key = (
@@ -1117,41 +1840,62 @@ def main():
             )
 
             if key in sent:
+
                 logging.info(
-                    f"⏭️ Duplicate: {symbol}"
+                    f"⏭️ Duplicate: "
+                    f"{symbol}"
                 )
+
                 continue
 
             message = format_signal(
                 signal
             )
 
-            send_telegram(message)
+            send_telegram(
+                message
+            )
 
-            save_sent(key)
-            sent.add(key)
+            save_sent(
+                key
+            )
 
-            found.append(signal)
+            sent.add(
+                key
+            )
+
+            signals_sent += 1
 
             logging.info(
-                f"📩 SENT {symbol} "
+                f"📩 SENT "
+                f"{symbol} "
                 f"{signal['direction']} "
                 f"Score={signal['score']}"
             )
 
-        except Exception as e:
+        except Exception as exc:
 
+            # IMPORTANT:
+            # One bad symbol must never stop
+            # the entire scanner.
             logging.error(
-                f"{symbol}: {e}"
+                f"{symbol}: {exc}"
             )
 
-        # Stay gentle with public API.
-        time.sleep(0.15)
+        time.sleep(
+            REQUEST_DELAY
+        )
 
     logging.info(
-        f"✅ Scan finished. Signals sent: {len(found)}"
+        f"✅ Scan finished. "
+        f"Signals sent: {signals_sent}"
     )
 
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
